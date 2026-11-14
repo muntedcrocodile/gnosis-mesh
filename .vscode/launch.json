@@ -1,0 +1,51 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: Run current file",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "pythonArgs": [
+        "-X",
+        "frozen_modules=off"
+      ]
+    },
+    {
+      "name": "Python: Debug pytest tests",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": [
+        "tests",
+        "-v"
+      ],
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true,
+      "pythonArgs": [
+        "-X",
+        "frozen_modules=off"
+      ]
+    },
+    {
+      "name": "Python: Debug test in Test Explorer",
+      "type": "debugpy",
+      "request": "launch",
+      "purpose": [
+        "debug-test"
+      ],
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "justMyCode": true,
+      "pythonArgs": [
+        "-X",
+        "frozen_modules=off"
+      ]
+    }
+  ]
+}
