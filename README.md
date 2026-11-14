@@ -228,8 +228,9 @@ The default is `~/.p2pchat` on port 4777. The port is used for TCP and for UDP (
 | `messages.jsonl` | Message history, one JSON object per line. |
 | `daemon.log` | Output from the background node. |
 
-The CLI talks to the daemon through a Unix socket in `$XDG_RUNTIME_DIR` (or the system temp directory), named
-after the data directory.
+The CLI talks to the daemon through a Unix socket named after the data directory. It lives in `$XDG_RUNTIME_DIR`,
+or the system temp directory if that isn't set. If the resulting path would be too long for a Unix socket (about
+104 bytes), it falls back to the temp directory and then `/tmp`.
 
 ---
 

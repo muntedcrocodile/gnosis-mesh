@@ -83,8 +83,13 @@ class Store:
     def __init__(self, home: Path) -> None:
         self.home = home
         home.mkdir(parents=True, exist_ok=True)
-        run_dir = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()  # AF_UNIX paths are length-limited
-        self.sock = os.path.join(run_dir, f"p2pchat-{hashlib.sha1(str(home.resolve()).encode()).hexdigest()[:12]}.sock")
+        # AF_UNIX socket paths are limited to 108 bytes on Linux and 104 on macOS: use the first runtime dir whose
+        # socket path fits (/tmp always does), so a long $XDG_RUNTIME_DIR or $TMPDIR can't stop the node starting.
+        name = f"p2pchat-{hashlib.sha1(str(home.resolve()).encode()).hexdigest()[:12]}.sock"
+        for run_dir in (os.environ.get("XDG_RUNTIME_DIR"), tempfile.gettempdir(), "/tmp"):
+            self.sock = os.path.join(run_dir or "/tmp", name)
+            if len(self.sock.encode()) < 104:
+                break
 
     def _load(self, name: str) -> Json:
         p = self.home / name
