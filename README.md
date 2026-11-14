@@ -299,7 +299,7 @@ The provider record key for a peer is the sha256 multihash of `p2pchat:<peer ID>
 
 ### py-libp2p workarounds
 
-`p2pchat.py` works around several py-libp2p 0.8.1 issues. Each one is commented in the code:
+`p2pchat.py` works around several py-libp2p 0.8.1 issues:
 
 - `BasicHost.get_addrs()` mangles `/p2p-circuit` addresses, so the node builds its advertised address list
   itself.

@@ -1,111 +1,74 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-# p2pchat - peer-to-peer chat over libp2p
-# Copyright (C) 2026 muntedcrocodile
-#
-# This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero
-# General Public License as published by the Free Software Foundation, version 3.
-#
-# This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the
-# implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public
-# License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License along with this program. If not, see
-# <https://www.gnu.org/licenses/>.
-"""Minimal libp2p peer-to-peer chat: a background daemon plus a click CLI."""
 
-from __future__ import annotations
-
-import hashlib
-import ipaddress
-import json
-import logging
-import os
-import queue
-import random
-import socket
-import subprocess
-import sys
-import tempfile
-import time
+import hashlib, ipaddress, json, logging, os, queue, random, socket, subprocess, sys, tempfile, time
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-import click
-import multihash
-import trio
-from libp2p import new_host
-from libp2p.abc import IHost, INetStream
-from libp2p.crypto.ed25519 import create_new_key_pair
-from libp2p.crypto.x25519 import create_new_key_pair as create_x25519_key_pair
-from libp2p.custom_types import TProtocol
+import click, multihash, trio
+from click import echo
+from trio import move_on_after as deadline, open_nursery as nursery
+from libp2p import ID, new_host
+from libp2p.abc import INetStream as Stream
+from libp2p.crypto import ed25519, x25519
 from libp2p.discovery.events.peerDiscovery import peerDiscovery
-from libp2p.host.autonat import AutoNATService, AutoNATStatus
+from libp2p.host.autonat import AutoNATService, AutoNATStatus as Nat
 from libp2p.host.autonat.autonat import AUTONAT_PROTOCOL_ID
 from libp2p.identity.identify_push.identify_push import push_identify_to_peers
-from libp2p.kad_dht.kad_dht import DHTMode, KadDHT
+from libp2p.kad_dht import DHTMode as Mode, KadDHT
 from libp2p.network.stream.exceptions import StreamEOF
-from libp2p.peer.id import ID
 from libp2p.peer.peerinfo import PeerInfo, info_from_p2p_addr
-from libp2p.peer.peerstore import PERMANENT_ADDR_TTL
-from libp2p.relay.circuit_v2.config import RelayConfig, RelayRole
-from libp2p.relay.circuit_v2.dcutr import DCUtRProtocol
-from libp2p.relay.circuit_v2.protocol import PROTOCOL_ID as HOP_PROTOCOL_ID
-from libp2p.relay.circuit_v2.protocol import CircuitV2Protocol
-from libp2p.relay.circuit_v2.resources import RelayLimits
-from libp2p.relay.circuit_v2.transport import CircuitV2Transport
-from libp2p.security.noise.transport import PROTOCOL_ID as NOISE_PROTOCOL_ID
-from libp2p.security.noise.transport import Transport as NoiseTransport
-from libp2p.tools.anyio_service import background_trio_service
+from libp2p.relay.circuit_v2 import PROTOCOL_ID as HOP, CircuitV2Protocol, CircuitV2Transport, DCUtRProtocol
+from libp2p.relay.circuit_v2.config import RelayConfig, RelayLimits, RelayRole
+from libp2p.security.noise.transport import PROTOCOL_ID as NOISE, Transport as Noise
+from libp2p.tools.anyio_service import background_trio_service as service
 from libp2p.utils.address_validation import _safe_get_network_addrs, is_ipv6_available
-from multiaddr import Multiaddr
+from multiaddr import Multiaddr as Addr
 from multiaddr.protocols import P_P2P
 
-PROTO = TProtocol("/p2pchat/1.0.0")
-MAX_MSG = 1 << 20
-RELAY_TARGET = 3  # public relay reservations to hold while behind NAT
-IPFS_BOOTSTRAP = [  # public IPFS DHT entry points (Kubo defaults)
-    "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
-    "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
-    "/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
-    "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
+PROTO: Any = "/p2pchat/1.0.0"
+RELAY_TARGET = 3
+MARS = "/ip4/104.131.131.82/{}/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ"
+IPFS_BOOTSTRAP = [
+    *(f"/dnsaddr/bootstrap.libp2p.io/p2p/Qm{p}" for p in ("NnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
+      "QCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa", "bLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
+      "cZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt")),
     "/dnsaddr/va1.bootstrap.libp2p.io/p2p/12D3KooWKnDdG3iXw9eTFijk3EWSunZcFi54Zka4wmtqtt6rPxc8",
-    "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
-    "/ip4/104.131.131.82/udp/4001/quic-v1/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
+    MARS.format("tcp/4001"), MARS.format("udp/4001/quic-v1"),
 ]
 Json = dict[str, Any]
 log = logging.getLogger("p2pchat")
+Error = click.ClickException
 
-
-# ---------- local storage (config.json is written by the CLI, peers.json + messages.jsonl by the daemon) ----------
 
 class Store:
     def __init__(self, home: Path) -> None:
         self.home = home
         home.mkdir(parents=True, exist_ok=True)
-        run_dir = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()  # AF_UNIX paths are length-limited
-        self.sock = os.path.join(run_dir, f"p2pchat-{hashlib.sha1(str(home.resolve()).encode()).hexdigest()[:12]}.sock")
+        run = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+        self.sock = f"{run}/p2pchat-{hashlib.sha1(bytes(home.resolve())).hexdigest()[:12]}.sock"
 
-    def _load(self, name: str) -> Json:
+    def load(self, name: str) -> Json:
         p = self.home / name
         return json.loads(p.read_text()) if p.exists() else {}
 
-    def _save(self, name: str, data: Json) -> None:
+    def save(self, name: str, data: Json) -> None:
         tmp = self.home / f".{name}.tmp"
         tmp.write_text(json.dumps(data, indent=2))
         tmp.replace(self.home / name)
 
     def config(self) -> Json:
-        return {"username": "", "nicks": {}, "blocked": [], **self._load("config.json")}
+        return {"username": "", "nicks": {}, "blocked": [], **self.load("config.json")}
 
-    def set_config(self, **kw: Any) -> None:
-        self._save("config.json", {**self.config(), **kw})
+    def configure(self, **kw: Any) -> None:
+        self.save("config.json", self.config() | kw)
 
     def peers(self) -> Json:
-        return self._load("peers.json")
+        return self.load("peers.json")
 
-    def save_peers(self, peers: Json) -> None:
-        self._save("peers.json", peers)
+    def blocked(self, pid: str) -> bool:
+        return pid in self.config()["blocked"]
 
     def key_seed(self) -> bytes:
         p = self.home / "key"
@@ -114,505 +77,353 @@ class Store:
             p.chmod(0o600)
         return p.read_bytes()
 
-    def log_message(self, peer: str, direction: str, text: str) -> None:
+    def add_message(self, peer: str, direction: str, text: str) -> None:
         with open(self.home / "messages.jsonl", "a") as f:
-            f.write(json.dumps({"ts": time.time(), "peer": peer, "dir": direction, "text": text}) + "\n")
+            print(json.dumps({"ts": time.time(), "peer": peer, "dir": direction, "text": text}), file=f)
 
     def messages(self) -> list[Json]:
         p = self.home / "messages.jsonl"
-        return [json.loads(line) for line in p.read_text().splitlines() if line] if p.exists() else []
+        return [json.loads(line) for line in p.read_text().splitlines()] if p.exists() else []
 
     def label(self, pid: str) -> str:
-        nick = self.config()["nicks"].get(pid)
-        name = self.peers().get(pid, {}).get("name")
-        return nick or name or f"{pid[:6]}…{pid[-6:]}"
+        return self.config()["nicks"].get(pid) or self.peers().get(pid, {}).get("name") or f"{pid[:6]}…{pid[-6:]}"
 
     def resolve(self, who: str) -> str:
-        """Map a nickname, username or peer ID to a peer ID (local nicknames win over self-chosen usernames)."""
-        for pid, nick in self.config()["nicks"].items():
-            if nick == who:
-                return pid
-        named = [pid for pid, p in self.peers().items() if p.get("name") == who]
+        named = [p for p, n in self.config()["nicks"].items() if n == who]
+        named = named or [p for p, v in self.peers().items() if v.get("name") == who]
         if len(named) > 1:
-            raise click.ClickException(f"username '{who}' is ambiguous ({', '.join(named)}); use a peer ID or nickname")
+            raise Error(f"'{who}' is ambiguous ({', '.join(named)}); use a peer ID")
         if named:
             return named[0]
-        try:
+        with suppress(Exception):
             multihash.decode(ID.from_base58(who).to_bytes())
             return who
-        except Exception:
-            raise click.ClickException(f"'{who}' is not a known nickname, username or valid peer ID")
+        raise Error(f"'{who}' is not a known nickname, username or valid peer ID")
 
 
-# ---------- libp2p daemon ----------
-
-async def read_all(stream: INetStream) -> bytes:
+async def read_all(stream: Stream) -> bytes:
     buf = b""
-    try:
+    with suppress(StreamEOF):
         while chunk := await stream.read(65536):
             buf += chunk
-            if len(buf) > MAX_MSG:
+            if len(buf) > 1 << 20:
                 raise ValueError("message too large")
-    except StreamEOF:
-        pass
     return buf
 
 
-def is_circuit(addr: Multiaddr) -> bool:
+def is_circuit(addr: Addr) -> bool:
     return "/p2p-circuit" in str(addr)
 
 
-def addr_rank(addr: Multiaddr) -> int:
-    """Dial order: public/DNS first, then private LAN, link-local, loopback."""
+def addr_rank(addr: Addr) -> int:
     for proto in ("ip4", "ip6"):
-        try:
+        with suppress(Exception):
             ip = ipaddress.ip_address(addr.value_for_protocol(proto))
-        except Exception:
-            continue
-        return 3 if ip.is_loopback else 2 if ip.is_link_local else 0 if ip.is_global else 1
-    return 0  # dns / dnsaddr
+            return 3 if ip.is_loopback else 2 if ip.is_link_local else 0 if ip.is_global else 1
+    return 0
 
 
-def expand(addr: Multiaddr) -> list[Multiaddr]:
-    """Replace a wildcard listen IP with each local interface IP, keeping the rest (libp2p's helper drops /quic-v1)."""
+def expand(addr: Addr) -> list[Addr]:
     s = str(addr)
-    for fam, wildcard in ((4, "/ip4/0.0.0.0/"), (6, "/ip6/::/")):
+    for fam, wildcard, loopback in ((4, "/ip4/0.0.0.0/", "127.0.0.1"), (6, "/ip6/::/", "::1")):
         if s.startswith(wildcard):
-            loopback = "127.0.0.1" if fam == 4 else "::1"
             ips = dict.fromkeys(_safe_get_network_addrs(fam) + [loopback])
-            return [Multiaddr(f"/ip{fam}/{ip}/{s[len(wildcard):]}") for ip in ips]
+            return [Addr(f"/ip{fam}/{ip}/{s[len(wildcard):]}") for ip in ips]
     return [addr]
 
 
-def addr_order(addr: Multiaddr) -> tuple[bool, bool, int, bool]:
-    """Advertise order: non-loopback IPv4 (public, then private), IPv6, loopback last; TCP before QUIC.
-    DCUtR binds hole-punch dials to our *first* TCP address and other swarms dial only the first per transport."""
+def addr_order(addr: Addr) -> tuple[int, ...]:
     rank, s = addr_rank(addr), str(addr)
     return rank == 3, s.startswith("/ip6/"), rank, "/quic" in s
 
 
-def rendezvous_key(pid: str) -> str:
-    """DHT provider key (hex sha256 multihash) under which a peer announces its addresses."""
+def rendezvous_key(pid: ID) -> str:
     return "1220" + hashlib.sha256(f"p2pchat:{pid}".encode()).hexdigest()
 
 
 class Node:
-    def __init__(self, store: Store, port: int, bootstrap: list[str], echo: bool, mdns: bool, public: bool) -> None:
-        self.store, self.bootstrap, self.echo, self.public = store, bootstrap, echo, public
+    def __init__(self, store: Store, port: int, bootstrap: list[str], mdns: bool, public: bool) -> None:
+        self.store, self.port, self.bootstrap = store, port, bootstrap
         fams = ["/ip4/0.0.0.0"] + (["/ip6/::"] if is_ipv6_available() else [])
-        self.listen = [Multiaddr(f"{f}/{t}") for f in fams for t in (f"tcp/{port}", f"udp/{port}/quic-v1")]
-        self.keys = create_new_key_pair(store.key_seed())
-        self.host: IHost = new_host(
-            key_pair=self.keys, listen_addrs=self.listen, enable_quic=True,
-            # Noise only: py-libp2p also offers plaintext/secio by default, which would let a peer skip
-            # encryption and claim any peer ID.
-            sec_opt={NOISE_PROTOCOL_ID: NoiseTransport(self.keys, noise_privkey=create_x25519_key_pair().private_key)},
+        self.listen = [Addr(f"{f}/{t}") for f in fams for t in (f"tcp/{port}", f"udp/{port}/quic-v1")]
+        keys = ed25519.create_new_key_pair(store.key_seed())
+        self.host: Any = new_host(
+            key_pair=keys, listen_addrs=self.listen, enable_quic=True,
+            sec_opt={NOISE: Noise(keys, noise_privkey=x25519.create_new_key_pair().private_key)},
             enable_mDNS=mdns, enable_upnp=public, bootstrap=bootstrap + (IPFS_BOOTSTRAP if public else []) or None,
             bootstrap_allow_ipv6=True, addrs_factory=lambda addrs: [x for a in addrs for x in expand(a)])
-        # BasicHost.get_addrs() truncates /p2p/<relay>/p2p-circuit addrs, so we build the advertised list ourselves
-        # (identify, signed peer records and DHT provider records all read it).
+        self.ps = self.host.get_peerstore()
+        self.id: ID = self.host.get_id()
         self.direct_addrs = self.host.get_addrs
-        self.host.get_addrs = self.advertised  # type: ignore[method-assign]
-        # The peerstore can evict our *own* entry once it holds >1000 peers (easy on the public DHT); identify
-        # then raises and takes the host down. Serve our keys directly instead.
-        self.host.get_public_key = lambda: self.keys.public_key  # type: ignore[method-assign]
-        self.host.get_private_key = lambda: self.keys.private_key  # type: ignore[method-assign]
-        # Join the public DHT as a client until AutoNAT confirms we are reachable.
-        self.dht = KadDHT(self.host, DHTMode.CLIENT if public else DHTMode.SERVER, enable_random_walk=True)
-        # Every node is a relay (rendezvous point) for other chat peers; see hop_acl.
-        self.circuit = CircuitV2Protocol(self.host, RelayLimits(duration=3600, data=16 << 20, max_circuit_conns=64,
-                                                                max_reservations=64), allow_hop=True)
+        vars(self.host).update(get_addrs=self.advertised, get_public_key=lambda: keys.public_key,
+                               get_private_key=lambda: keys.private_key)
+        self.dht = KadDHT(self.host, Mode.CLIENT if public else Mode.SERVER, enable_random_walk=True)
+        self.circuit = CircuitV2Protocol(self.host, RelayLimits(3600, 16 << 20, 64, 64), allow_hop=True)
         self.relay_hop = self.circuit._handle_hop_stream
-        self.circuit._handle_hop_stream = self.hop_acl  # type: ignore[method-assign]
+        vars(self.circuit).update(_handle_hop_stream=self.hop_acl)
         self.relay = CircuitV2Transport(self.host, self.circuit, RelayConfig(roles=RelayRole.STOP | RelayRole.CLIENT))
-        self.relay.discovery.auto_reserve = False  # we choose relays ourselves (keep_relays)
-        self.dcutr = DCUtRProtocol(self.host)
-        self.autonat = AutoNATService(self.host)  # type: ignore[arg-type]
-        self.reachability = AutoNATStatus.UNKNOWN
+        self.discovery = self.relay.discovery
+        self.discovery.auto_reserve = False
+        self.autonat = AutoNATService(cast(Any, self.host))
+        self.nat = Nat.UNKNOWN
         self.greeted: set[ID] = set()
-        self.dial_errors: list[str] = []
-        self.upnp_ports: list[tuple[str, str]] = []
         self.last_addrs: set[str] = set()
-        self.reannounce = trio.Event()
-        self.found: queue.SimpleQueue[PeerInfo] = queue.SimpleQueue()  # mDNS callbacks arrive on another thread
+        self.found: queue.SimpleQueue[PeerInfo] = queue.SimpleQueue()
         self.host.set_stream_handler(PROTO, self.handle)
-        self.host.set_stream_handler(AUTONAT_PROTOCOL_ID, self.autonat.handle_stream)  # type: ignore[arg-type]
+        self.host.set_stream_handler(AUTONAT_PROTOCOL_ID, self.autonat.handle_stream)
         peerDiscovery.register_peer_discovered_handler(self.found.put)
 
-    @property
-    def me(self) -> str:
-        return self.host.get_id().to_base58()
+    def online(self) -> list[ID]:
+        return self.host.get_connected_peers()
 
-    # --- addresses ---
-    def addrs(self, pid: ID) -> list[Multiaddr]:
-        try:
-            return self.host.get_peerstore().addrs(pid)
-        except Exception:  # unknown peer
-            return []
+    def addrs(self, pid: ID) -> list[Addr]:
+        with suppress(Exception):
+            return self.ps.addrs(pid)
+        return []
 
-    def reserved_relays(self) -> list[ID]:
-        d = self.relay.discovery
-        return [p for p in d.get_relays() if (i := d.get_relay_info(p)) and i.has_reservation]
+    def reserved(self) -> list[ID]:
+        return [p for p, i in self.discovery._discovered_relays.items() if i.has_reservation]
 
-    def advertised(self) -> list[Multiaddr]:
+    def advertised(self) -> list[Addr]:
         addrs = sorted(self.direct_addrs(), key=addr_order)
-        if self.reachability == AutoNATStatus.PUBLIC:
-            return addrs
-        relays = 0
-        for relay in self.reserved_relays():  # advertise up to 3 relays that are themselves publicly dialable
-            public = sorted((a for a in self.addrs(relay) if not is_circuit(a) and addr_rank(a) == 0), key=str)
-            if public and relays < 3:
-                relays += 1
-                addrs += [Multiaddr(f"{a.decapsulate_code(P_P2P)}/p2p/{relay}/p2p-circuit/p2p/{self.me}")
-                          for a in public[:2]]
+        if self.nat != Nat.PUBLIC:
+            for relay in list(filter(self.public_addrs, self.reserved()))[:3]:
+                addrs += [Addr(f"{a.decapsulate_code(P_P2P)}/p2p/{relay}/p2p-circuit/p2p/{self.id}")
+                          for a in self.public_addrs(relay)[:2]]
         return addrs
 
-    def learn(self, pid: ID, addrs: list[str]) -> None:
+    def public_addrs(self, pid: ID) -> list[Addr]:
+        return sorted((a for a in self.addrs(pid) if not is_circuit(a) and addr_rank(a) == 0), key=str)
+
+    def learn(self, pid: ID, addrs: list[Any]) -> None:
         ma = []
         for a in addrs:
-            try:
-                ma.append(Multiaddr(a))
-            except Exception:
-                pass
-        if ma and pid != self.host.get_id():
-            self.host.get_peerstore().add_addrs(pid, ma, PERMANENT_ADDR_TTL)
+            with suppress(Exception):
+                ma.append(Addr(str(a)))
+        if ma and pid != self.id:
+            self.ps.add_addrs(pid, ma, 0)
 
     def speaks(self, pid: ID, proto: str) -> bool:
-        try:
-            return bool(self.host.get_peerstore().supports_protocols(pid, [proto]))
-        except Exception:
-            return False
+        return bool(self.ps.supports_protocols(pid, [proto]))
 
-    def connected(self, pid: ID) -> bool:
-        return pid in self.host.get_connected_peers()
+    def chat_peer(self, pid: ID) -> bool:
+        return self.speaks(pid, PROTO) and not self.store.blocked(str(pid))
 
     def link(self, pid: ID) -> str:
-        """'direct' if any connection to pid is direct (e.g. after DCUtR hole punching), else 'relayed'."""
-        conns: Any = getattr(self.host.get_network(), "connections", {}).get(pid, [])
-        for c in conns if isinstance(conns, list) else [conns]:
-            try:
-                if not any(is_circuit(a) for a in c.get_transport_addresses()):
-                    return "direct"
-            except Exception:
+        for c in self.host.get_network().connections.get(pid, []):
+            if not any(map(is_circuit, c.get_transport_addresses())):
                 return "direct"
         return "relayed"
 
-    def blocked(self, pid: str) -> bool:
-        return pid in self.store.config()["blocked"]
-
     def remember(self, pid: ID, name: str | None) -> None:
-        """Record an encountered chat peer (with its self-assigned username) in peers.json."""
         peers = self.store.peers()
-        entry = peers.setdefault(pid.to_base58(), {})
-        addrs = [str(a) for a in self.addrs(pid)]
-        entry.update(addrs=addrs or entry.get("addrs", []), seen=time.time())
+        entry = peers.setdefault(str(pid), {})
+        entry.update(addrs=list(map(str, self.addrs(pid))) or entry.get("addrs", []), seen=time.time())
         if name:
             entry["name"] = name
-        self.store.save_peers(peers)
+        self.store.save("peers.json", peers)
 
-    # --- the /p2pchat protocol: one JSON request + one JSON reply per stream ---
-    async def handle(self, stream: INetStream) -> None:
+    async def handle(self, stream: Stream) -> None:
         pid = stream.muxed_conn.peer_id
-        if self.blocked(pid.to_base58()):
-            await stream.reset()
-            return
+        sender = str(pid)
         try:
+            if self.store.blocked(sender):
+                raise PermissionError
             req = json.loads(await read_all(stream))
             self.remember(pid, req.get("name"))
             reply: Json = {"name": self.store.config()["username"]}
             if req["t"] == "msg":
-                self.store.log_message(pid.to_base58(), "in", req["text"])
-                if self.echo:
-                    click.echo(f"\n[{self.store.label(pid.to_base58())}] {req['text']}")
+                self.store.add_message(sender, "in", req["text"])
+                echo(f"\n[{self.store.label(sender)}] {req['text']}")
             elif req["t"] == "peers":
                 reply["peers"] = [{"id": k, **v} for k, v in self.store.peers().items()
-                                  if k != pid.to_base58() and not self.blocked(k)]
+                                  if k != sender and not self.store.blocked(k)]
             await stream.write(json.dumps(reply).encode())
             await stream.close()
             self.greeted.add(pid)
-        except Exception as e:
-            log.debug("bad request from %s: %s", pid, e)
+        except Exception:
             await stream.reset()
 
     async def request(self, pid: ID, t: str, **body: Any) -> Json:
         with trio.fail_after(30):
             stream = await self.host.new_stream(pid, [PROTO])
             await stream.write(json.dumps({"t": t, "name": self.store.config()["username"], **body}).encode())
-            await stream.close_write()  # type: ignore[attr-defined]  # NetStream has it; the ABC doesn't
+            await stream.close_write()
             reply = json.loads(await read_all(stream))
             await stream.close()
         self.remember(pid, reply.get("name"))
-        for p in reply.get("peers", []):  # peer exchange: learn addresses of peers they met
-            try:
+        for p in reply.get("peers", []):
+            with suppress(Exception):
                 self.learn(ID.from_base58(p["id"]), p.get("addrs", []))
-            except Exception:
-                pass
         return reply
 
     async def greet(self, pid: ID, t: str = "hello") -> None:
-        """Exchange usernames (and optionally peer lists); silently ignores failures."""
-        try:
+        with suppress(Exception):
             await self.request(pid, t)
-        except Exception as e:
-            log.debug("%s to %s failed: %s", t, pid, e)
 
-    # --- connecting ---
-    async def race(self, addrs: list[Multiaddr], dial: Callable[[Multiaddr], Awaitable[Any]]) -> bool:
-        """Happy-eyeballs: start a dial every 300ms, first success wins and cancels the rest."""
-        ok = False
-        async with trio.open_nursery() as n:
-            async def attempt(addr: Multiaddr, delay: float) -> None:
-                nonlocal ok
-                await trio.sleep(delay)
-                with trio.move_on_after(20):
-                    try:
-                        await dial(addr)
-                        ok = True
-                        n.cancel_scope.cancel()
-                    except Exception as e:
-                        log.debug("dial %s failed: %s", addr, e)
-                        self.dial_errors.append(f"{addr}: {type(e).__name__}: {e}")
-            for i, addr in enumerate(addrs[:16]):
-                n.start_soon(attempt, addr, i * 0.3)
-        return ok
-
-    async def dial(self, pid: ID) -> bool:
-        """Connect directly over every known address (best first), falling back to relayed circuits."""
-        if pid == self.host.get_id():
-            return False
-        if self.connected(pid):
-            return True
-        addrs = list({str(a): a for a in self.addrs(pid)}.values())
-        direct = sorted((a for a in addrs if not is_circuit(a)), key=addr_rank)
-        # Stored/advertised circuit addrs usually omit the trailing /p2p/<target>, which the circuit dialer requires.
-        relayed = [a if str(a).endswith(f"/p2p/{pid}") else Multiaddr(f"{a}/p2p/{pid}") for a in addrs if is_circuit(a)]
-        net: Any = self.host.get_network()
-        if hasattr(net, "unblock_peer"):
-            net.unblock_peer(pid)  # don't let a recent failure on stale addresses block this attempt
-        # Rendezvous: any chat peer we share with the target can relay for us (it holds a reservation from the
-        # target), then DCUtR hole-punches a direct connection. Public relays the target advertised come last.
-        # Tiers start staggered (direct, +2s shared peers, +4s public relays); the first success wins.
-        shared = [Multiaddr(f"/p2p/{p}/p2p-circuit/p2p/{pid}") for p in self.chat_relays() if p != pid]
-        ok, began = False, trio.current_time()
-        self.dial_errors = []
-        async with trio.open_nursery() as n:
-            async def tier(name: str, addrs: list[Multiaddr], dial: Callable[[Multiaddr], Awaitable[Any]],
-                           delay: float) -> None:
-                nonlocal ok
-                await trio.sleep(delay if direct else delay / 2)
-                if await self.race(addrs, dial):
-                    ok = True
-                    log.info("connected to %s via %s in %.1fs", pid, name, trio.current_time() - began)
-                    n.cancel_scope.cancel()
-            for name, addrs, dial, delay in (("direct", direct, lambda a: net.dial_addr(a, pid), 0.0),
-                                             ("shared chat peer", shared, lambda a: self.relay_dial(a, pid), 2.0),
-                                             ("public relay", relayed, lambda a: self.relay_dial(a, pid), 4.0)):
-                if addrs:
-                    n.start_soon(tier, name, addrs, dial, delay)
-        if not ok and (direct or shared or relayed):
-            log.info("could not connect to %s (%d direct, %d shared, %d relayed candidates): %s",
-                     pid, len(direct), len(shared), len(relayed), "; ".join(self.dial_errors[:4]))
-        return ok
-
-    async def relay_dial(self, circuit: Multiaddr, pid: ID) -> None:
+    async def relay_dial(self, circuit: Addr, pid: ID) -> None:
         relay_ma, _ = self.relay.parse_circuit_ma(circuit)
-        relay = ID.from_base58(str(relay_ma.get_peer_id()))
-        base = relay_ma.decapsulate_code(P_P2P)
-        if base.protocols():
-            self.learn(relay, [str(base)])
+        if (base := relay_ma.decapsulate_code(P_P2P)).protocols():
+            self.learn(ID.from_base58(str(relay_ma.get_peer_id())), [base])
         raw = await self.relay._dial_via_circuit_addr(circuit, PeerInfo(pid, [circuit]))
-        await self.host.upgrade_outbound_connection(raw, pid)  # the receiving side drives the DCUtR hole punch
+        await self.host.upgrade_outbound_connection(raw, pid)
 
-    async def try_connect(self, pid: ID) -> bool:
-        if not await self.dial(pid):
+    async def connect(self, pid: ID) -> bool:
+        if pid == self.id:
             return False
+        if pid not in self.online():
+            addrs = dict.fromkeys(self.addrs(pid))
+            direct = sorted((a for a in addrs if not is_circuit(a)), key=addr_rank)
+            target = f"/p2p/{pid}"
+            relayed = [Addr(str(a).removesuffix(target) + target) for a in addrs if is_circuit(a)]
+            shared = [Addr(f"/p2p/{p}/p2p-circuit{target}") for p in self.chat_relays() if p != pid]
+            net = self.host.get_network()
+            net.unblock_peer(pid)
+            won, began = "", trio.current_time()
+            errors: list[str] = []
+            async with nursery() as n:
+                async def attempt(delay: float, addr: Addr) -> None:
+                    nonlocal won
+                    await trio.sleep(delay)
+                    with deadline(20):
+                        try:
+                            await (self.relay_dial if is_circuit(addr) else net.dial_addr)(addr, pid)
+                            won = str(addr)
+                            n.cancel_scope.cancel()
+                        except Exception as e:
+                            errors.append(f"{addr}: {type(e).__name__}: {e}")
+                for base, tier in ((0, direct[:16]), (2, shared[:8]), (4, relayed[:8])):
+                    for i, addr in enumerate(tier):
+                        n.start_soon(attempt, (base + i * 0.3) * (1 if direct else 0.5), addr)
+            if not won:
+                log.info("could not connect to %s: %s", pid, "; ".join(errors[:4]) or "no addresses")
+                return False
+            log.info("connected to %s via %s in %.1fs", pid, won, trio.current_time() - began)
         if pid not in self.greeted:
             self.greeted.add(pid)
             await self.greet(pid)
         return True
 
     async def find(self, pid: ID) -> bool:
-        """Locate a peer by ID: known addrs, peer exchange, then DHT peer lookup + provider records in parallel."""
-        if await self.try_connect(pid):
+        if await self.connect(pid):
             return True
-        async with trio.open_nursery() as n:
-            for other in self.host.get_connected_peers():
-                if other.to_base58() in self.store.peers():
+        async with nursery() as n:
+            for other in self.online():
+                if str(other) in self.store.peers():
                     n.start_soon(self.greet, other, "peers")
-        if await self.try_connect(pid):
+        if await self.connect(pid):
             return True
-        found = False
-        async with trio.open_nursery() as n:
-            async def via(lookup: Callable[[], Awaitable[Any]]) -> None:
-                nonlocal found
-                with trio.move_on_after(60):
-                    try:
-                        await lookup()
-                    except Exception as e:
-                        log.debug("lookup failed: %s", e)
-                if await self.try_connect(pid):
-                    found = True
+        async with nursery() as n:
+            async def via(lookup: Awaitable[Any]) -> None:
+                with deadline(60), suppress(Exception):
+                    await lookup
+                if await self.connect(pid):
                     n.cancel_scope.cancel()
-            n.start_soon(via, lambda: self.peer_lookup(pid))
-            n.start_soon(via, lambda: self.provider_lookup(pid))
-        return found or await self.try_connect(pid)
+            n.start_soon(via, self.dht.peer_routing.find_closest_peers_network(pid.to_bytes()))
+            n.start_soon(via, self.provider_lookup(pid))
+        return await self.connect(pid)
 
     async def provider_lookup(self, pid: ID) -> None:
-        providers = await self.dht.find_providers(rendezvous_key(pid.to_base58()), 10)
-        log.info("provider lookup for %s: %s", pid, [(str(i.peer_id), len(i.addrs)) for i in providers])
-        for info in providers:
+        for info in await self.dht.find_providers(rendezvous_key(pid), 10):
             if info.peer_id == pid:
-                self.learn(pid, [str(a) for a in info.addrs])
+                self.learn(pid, info.addrs)
 
-    async def peer_lookup(self, pid: ID) -> None:
-        closest = await self.dht.peer_routing.find_closest_peers_network(pid.to_bytes())
-        log.info("DHT lookup for %s: target among %d closest=%s, known addrs=%d",
-                 pid, len(closest), pid in closest, len(self.addrs(pid)))
-
-    # --- staying reachable and findable ---
     async def announce(self) -> bool:
-        """Self-lookup (so the DHT peers closest to our ID know our addrs) + provider record under our key."""
-        if self.dht.get_routing_table_size() == 0:
+        if not self.dht.get_routing_table_size():
             return False
-        with trio.move_on_after(120):
-            closest = await self.dht.peer_routing.find_closest_peers_network(self.host.get_id().to_bytes())
-            provided = bool(await self.dht.provide(rendezvous_key(self.me)))
-            log.info("announced: %d closest peers, provider record stored=%s", len(closest), provided)
+        with deadline(120):
+            await self.dht.peer_routing.find_closest_peers_network(self.id.to_bytes())
+            provided = bool(await self.dht.provide(rendezvous_key(self.id)))
+            log.info("announced, provider record stored=%s", provided)
             return provided
-        log.info("announce timed out")
         return False
 
-    def chat_relays(self) -> list[ID]:
-        """Connected chat peers offering the relay (hop) service, i.e. usable rendezvous points."""
-        return [p for p in self.host.get_connected_peers()
-                if self.speaks(p, PROTO) and self.speaks(p, HOP_PROTOCOL_ID) and not self.blocked(p.to_base58())]
+    async def watch_addrs(self) -> bool:
+        if (addrs := {str(a) for a in self.advertised()}) != self.last_addrs:
+            self.last_addrs = addrs
+            with deadline(30):
+                await push_identify_to_peers(self.host)
+            await self.announce()
+        return True
 
-    async def hop_acl(self, stream: INetStream) -> None:
-        """Relay only for fellow chat peers (we are a rendezvous point for them, not a public relay)."""
-        pid = stream.muxed_conn.peer_id
-        if self.speaks(pid, PROTO) and not self.blocked(pid.to_base58()):
+    def chat_relays(self) -> list[ID]:
+        return [p for p in self.online() if self.chat_peer(p) and self.speaks(p, HOP)]
+
+    async def hop_acl(self, stream: Stream) -> None:
+        if self.chat_peer(stream.muxed_conn.peer_id):
             await self.relay_hop(stream)
         else:
             await stream.reset()
 
     async def reserve(self, relay: ID) -> None:
-        d = self.relay.discovery
-        with trio.move_on_after(20):
-            if d.get_relay_info(relay) is None:
-                await d._add_relay(relay)
-            await d.make_reservation(relay)
+        with deadline(20):
+            if relay not in self.discovery.get_relays():
+                await self.discovery._add_relay(relay)
+            await self.discovery.make_reservation(relay)
 
-    async def keep_relays(self) -> bool:
-        """Keep a reservation on every connected chat peer (so others sharing it can reach us) and, while not
-        publicly reachable, on RELAY_TARGET public relays; drop dead reservations and renew before expiry."""
-        d, now = self.relay.discovery, time.time()
-        for p in d.get_relays():
-            info = d.get_relay_info(p)
-            if info and info.has_reservation and (not self.connected(p) or (info.reservation_expires_at or now + 1e9) - now < 300):
-                info.has_reservation = False
-        reserved = set(self.reserved_relays())
-        async with trio.open_nursery() as n:
-            for p in self.chat_relays():
-                if p not in reserved:
-                    n.start_soon(self.reserve, p)
-        public = [p for p in self.reserved_relays() if not self.speaks(p, PROTO)]
-        hop = [p for p in self.host.get_connected_peers() if self.speaks(p, HOP_PROTOCOL_ID)]
-        log.info("relays: %d connected peers offer relaying, %d known to discovery, reserved on %d public + %d chat",
-                 len(hop), len(d.get_relays()), len(public), len(self.reserved_relays()) - len(public))
-        if self.reachability != AutoNATStatus.PUBLIC and len(public) < RELAY_TARGET:
-            # Prefer relays with a public address (only those can be advertised), try a few at a time.
-            candidates = [p for p in hop if p not in reserved and not self.speaks(p, PROTO)
-                          and any(addr_rank(a) == 0 and not is_circuit(a) for a in self.addrs(p))]
+    async def keep_relays(self) -> None:
+        for p, i in self.discovery._discovered_relays.items():
+            if p not in self.online() or (i.reservation_expires_at or 1e11) < time.time() + 300:
+                i.has_reservation = False
+        reserved = self.reserved()
+        wanted = [p for p in self.chat_relays() if p not in reserved]
+        if self.nat != Nat.PUBLIC:
+            candidates = [p for p in self.online() if self.speaks(p, HOP) and p not in reserved
+                          and not self.speaks(p, PROTO) and self.public_addrs(p)]
             random.shuffle(candidates)
-            async with trio.open_nursery() as n:
-                for p in candidates[:RELAY_TARGET - len(public)]:
-                    n.start_soon(self.reserve, p)
-        return True
+            wanted += candidates[:RELAY_TARGET - len([p for p in reserved if not self.speaks(p, PROTO)])]
+        async with nursery() as n:
+            for p in wanted:
+                n.start_soon(self.reserve, p)
 
     async def check_nat(self) -> bool:
-        """AutoNAT: become a DHT server when reachable, a DHT client when not."""
-        servers = [p for p in self.host.get_connected_peers() if self.speaks(p, AUTONAT_PROTOCOL_ID)]
+        servers = [p for p in self.online() if self.speaks(p, AUTONAT_PROTOCOL_ID)]
         if len(servers) < 4:
             return False
-        with trio.move_on_after(120):
-            self.reachability = await self.autonat.check_reachability(random.sample(servers, min(8, len(servers))))
-        public = self.reachability == AutoNATStatus.PUBLIC
-        if self.reachability != AutoNATStatus.UNKNOWN:
-            await self.dht.switch_mode(DHTMode.SERVER if public else DHTMode.CLIENT)
-        log.info("reachability: %s (asked %d AutoNAT servers)", self.reachability, len(servers))
-        return self.reachability != AutoNATStatus.UNKNOWN
-
-    async def every(self, seconds: float, job: Callable[[], Awaitable[bool | None]], retry: float = 15) -> None:
-        """Run job forever: every `seconds` after it reports success (True/None), sooner (`retry`) after False."""
-        while True:
-            ok: bool | None = False
-            try:
-                ok = await job()
-            except Exception as e:
-                log.debug("%s failed: %s", job.__name__, e)
-            await trio.sleep(seconds if ok is not False else retry)
-
-    async def watch_addrs(self) -> bool:
-        """When our advertised addrs change (e.g. new relay reservation): push identify and re-announce."""
-        addrs = {str(a) for a in self.host.get_addrs()}
-        if addrs != self.last_addrs:
-            self.last_addrs = addrs
-            with trio.move_on_after(30):
-                await push_identify_to_peers(self.host)
-            self.reannounce.set()
+        with deadline(120):
+            self.nat = await self.autonat.check_reachability(random.sample(servers, min(8, len(servers))))
+        log.info("reachability: %s", self.nat)
+        if self.nat == Nat.UNKNOWN:
+            return False
+        await self.dht.switch_mode(Mode.SERVER if self.nat == Nat.PUBLIC else Mode.CLIENT)
         return True
 
-    async def announce_loop(self) -> None:
+    async def every(self, seconds: float, job: Callable[[], Awaitable[Any]]) -> None:
         while True:
-            if not await self.announce():
-                await trio.sleep(15)
-                continue
-            self.reannounce = trio.Event()
-            with trio.move_on_after(600):  # refresh every 10 min, or right away when our addrs change
-                await self.reannounce.wait()
-
-    async def maintain(self) -> None:
-        async with trio.open_nursery() as n:
-            n.start_soon(self.every, 300, self.check_nat)
-            n.start_soon(self.every, 15, self.keep_relays)
-            n.start_soon(self.every, 5, self.watch_addrs)
-            n.start_soon(self.announce_loop)
+            ok = False
+            with suppress(Exception):
+                ok = await job()
+            await trio.sleep(seconds if ok else 15)
 
     async def background(self) -> None:
-        """Reconnect to known/bootstrap peers on start; then greet every chat peer we connect to."""
-        async with trio.open_nursery() as n:
+        async with nursery() as n:
             for addr in self.bootstrap:
-                try:
-                    info = info_from_p2p_addr(Multiaddr(addr))
-                except Exception:
-                    continue  # e.g. /dnsaddr: resolved by libp2p's bootstrap discovery instead
-                self.learn(info.peer_id, [str(a) for a in info.addrs])
-                n.start_soon(self.try_connect, info.peer_id)
+                with suppress(Exception):
+                    self.found.put(info_from_p2p_addr(Addr(addr)))
             for known, p in self.store.peers().items():
-                if not self.blocked(known):
-                    self.learn(ID.from_base58(known), p.get("addrs", []))
-                    n.start_soon(self.try_connect, ID.from_base58(known))
-            n.start_soon(self.maintain)
+                self.found.put(PeerInfo(ID.from_base58(known), p.get("addrs", [])))
+            jobs = (300, self.check_nat), (15, self.keep_relays), (5, self.watch_addrs), (600, self.announce)
+            for seconds, job in jobs:
+                n.start_soon(self.every, seconds, job)
             seen: set[ID] = set()
             while True:
                 while not self.found.empty():
                     info = self.found.get()
-                    if not self.blocked(info.peer_id.to_base58()):
-                        self.learn(info.peer_id, [str(a) for a in info.addrs])
-                        n.start_soon(self.try_connect, info.peer_id)
-                for pid in self.host.get_connected_peers():
+                    if not self.store.blocked(str(info.peer_id)):
+                        self.learn(info.peer_id, info.addrs)
+                        n.start_soon(self.connect, info.peer_id)
+                for pid in self.online():
                     if pid not in seen:
                         seen.add(pid)
                         n.start_soon(self.dht.add_peer, pid)
-                    if pid not in self.greeted and self.speaks(pid, PROTO) and not self.blocked(pid.to_base58()):
+                    if pid not in self.greeted and self.chat_peer(pid):
                         self.greeted.add(pid)
                         n.start_soon(self.greet, pid)
                 await trio.sleep(2)
 
-    # --- local control socket used by the CLI ---
     async def control(self, conn: trio.SocketStream, stop: trio.CancelScope) -> None:
-        req: Json = {}
-        try:  # a misbehaving or impatient client must never take the daemon down
+        req = None
+        with suppress(Exception):
             buf = b""
             while chunk := await conn.receive_some(65536):
                 buf += chunk
@@ -621,168 +432,130 @@ class Node:
                 reply = await self.command(req)
             except Exception as e:
                 reply = {"error": str(e) or type(e).__name__}
-            await conn.send_all(json.dumps(reply).encode() + b"\n")
+            await conn.send_all(json.dumps(reply).encode())
             await conn.aclose()
-        except Exception as e:
-            log.debug("control connection failed: %s", e)
-        if req.get("cmd") == "stop":
+        if req == {"cmd": "stop"}:
             stop.cancel()
 
     async def command(self, req: Json) -> Json:
-        if req["cmd"] == "status":
-            conns = self.host.get_connected_peers()
-            return {"id": self.me, "addrs": [str(a) for a in self.host.get_addrs()],
-                    "reachability": {AutoNATStatus.PUBLIC: "public", AutoNATStatus.PRIVATE: "behind NAT"}.get(
-                        self.reachability, "unknown"),
-                    "dht": f"{self.dht.mode.value}, {self.dht.get_routing_table_size()} peers in routing table",
-                    "relays": [p.to_base58() for p in self.reserved_relays()], "connections": len(conns),
-                    "connected": [[p.to_base58(), self.link(p)] for p in conns if p.to_base58() in self.store.peers()]}
-        if req["cmd"] == "stop":
+        cmd = req["cmd"]
+        if cmd == "status":
+            label, known = self.store.label, self.store.peers()
+            rows = [
+                ("peer id", self.id), ("username", self.store.config()["username"] or "-"),
+                ("reachability", {Nat.PUBLIC: "public", Nat.PRIVATE: "behind NAT"}.get(self.nat, "unknown")),
+                ("dht", f"{self.dht.mode.value}, {self.dht.get_routing_table_size()} peers in routing table"),
+                ("connections", len(self.online())), *[("relay", label(str(p))) for p in self.reserved()],
+                *[("addr", a) for a in self.advertised()],
+                *[("online", f"{label(str(p))} ({p}) [{self.link(p)}]") for p in self.online() if str(p) in known]]
+            return {"id": str(self.id), "text": "\n".join(f"{key + ':':14}{value}" for key, value in rows)}
+        if cmd == "stop":
             return {}
-        pid = ID.from_base58(req["peer"])
-        error = "not found"
-        for attempt in range(3):  # a connection can vanish right after connecting (relay limits, DCUtR handover)
+        pid, error = ID.from_base58(req["peer"]), ""
+        for _ in range(3):
             if not await self.find(pid):
-                return {"error": f"could not reach {req['peer']}"}
+                return {"error": f"could not reach {pid}"}
             try:
-                if req["cmd"] == "send":
+                if cmd == "send":
                     await self.request(pid, "msg", text=req["text"])
-                    self.store.log_message(req["peer"], "out", req["text"])
-                    return {}
-                if req["cmd"] == "peers":
-                    return await self.request(pid, "peers")
-                return {}  # "find"
+                    self.store.add_message(str(pid), "out", req["text"])
+                return await self.request(pid, "peers") if cmd == "peers" else {}
             except Exception as e:
                 error = f"{type(e).__name__}: {e}"
-                log.info("request to %s failed (attempt %d): %s", pid, attempt + 1, error)
                 await trio.sleep(1)
-        return {"error": f"could not deliver to {req['peer']}: {error}"}
-
-    async def slow_start(self) -> None:
-        """UPnP + public bootstrap take seconds; libp2p would block host.run() on them, so do them in the background."""
-        if self.upnp is not None:
-            with trio.move_on_after(30):
-                if await self.upnp.discover():
-                    self.upnp_ports = [(p, proto) for p in {a.value_for_protocol("tcp") for a in self.listen
-                                                            if "/tcp/" in str(a)} for proto in ("TCP", "UDP")]
-                    for port, proto in self.upnp_ports:
-                        await self.upnp.add_port_mapping(int(port), proto)
-        if self.boot is not None:
-            await self.boot.start()
-
-    async def shutdown(self) -> None:
-        if self.boot is not None:
-            self.boot.stop()
-        with trio.move_on_after(5):
-            for port, proto in self.upnp_ports:
-                await self.upnp.remove_port_mapping(int(port), proto)
+        return {"error": f"could not deliver to {pid}: {error}"}
 
     async def run(self) -> None:
-        self.boot, self.host.bootstrap = self.host.bootstrap, None  # type: ignore[attr-defined]
-        self.upnp, self.host.upnp = self.host.upnp, None  # type: ignore[attr-defined]
-        self.upnp_ports = []
+        boot, upnp, self.host.bootstrap, self.host.upnp = self.host.bootstrap, self.host.upnp, None, None
+        mapped = False
         try:
-            await self.serve()
+            async with self.host.run(self.listen), service(self.dht), service(self.circuit), \
+                    service(self.discovery), service(DCUtRProtocol(self.host)), nursery() as n:
+                echo(f"peer id: {self.id}")
+                n.start_soon(self.background)
+                with suppress(FileNotFoundError):
+                    os.unlink(self.store.sock)
+                sock = trio.socket.socket(trio.socket.AF_UNIX)
+                await sock.bind(self.store.sock)
+                sock.listen()
+                n.start_soon(trio.serve_listeners, lambda c: self.control(c, n.cancel_scope),
+                             [trio.SocketListener(sock)])
+                with deadline(30):
+                    if upnp and await upnp.discover():
+                        for p in ("TCP", "UDP"):
+                            mapped = await upnp.add_port_mapping(self.port, p)
+                if boot:
+                    await boot.start()
+            os.unlink(self.store.sock)
         finally:
-            with trio.CancelScope(shield=True):
-                await self.shutdown()
-
-    async def serve(self) -> None:
-        async with self.host.run(self.listen), background_trio_service(self.dht), \
-                background_trio_service(self.circuit), background_trio_service(self.relay.discovery), \
-                background_trio_service(self.dcutr), trio.open_nursery() as n:
-            click.echo(f"peer id: {self.me}")
-            for a in self.host.get_addrs():
-                click.echo(f"listening: {a}")
-            n.start_soon(self.slow_start)
-            n.start_soon(self.background)
-            if os.path.exists(self.store.sock):  # only bind once the host is up, so the CLI never waits on a half-started node
-                os.unlink(self.store.sock)
-            sock = trio.socket.socket(trio.socket.AF_UNIX)
-            await sock.bind(self.store.sock)
-            sock.listen()
-            n.start_soon(trio.serve_listeners, lambda c: self.control(c, n.cancel_scope), [trio.SocketListener(sock)])
-        os.unlink(self.store.sock)
+            with trio.CancelScope(shield=True), deadline(5):
+                if boot:
+                    boot.stop()
+                for p in ("TCP", "UDP") if mapped else ():
+                    await upnp.remove_port_mapping(self.port, p)
 
 
-# ---------- CLI ----------
+store: Store
+peer_arg = click.argument("peer")
 
-def daemon_call(store: Store, timeout: float = 90, **req: Any) -> Json:
+
+def call(timeout: float = 90, **req: Any) -> Json:
     try:
         with socket.socket(socket.AF_UNIX) as s:
             s.settimeout(timeout)
             s.connect(store.sock)
             s.sendall(json.dumps(req).encode())
             s.shutdown(socket.SHUT_WR)
-            buf = b""
-            while not buf.endswith(b"\n") and (chunk := s.recv(65536)):
-                buf += chunk
+            reply = json.load(s.makefile())
     except (FileNotFoundError, ConnectionRefusedError):
-        raise click.ClickException("daemon is not running; start it with `p2pchat.py start -d`")
+        raise Error("daemon is not running; start it with `p2pchat.py start -d`")
     except TimeoutError:
-        raise click.ClickException("daemon did not respond in time")
-    reply = json.loads(buf)
+        raise Error("daemon did not respond in time")
     if "error" in reply:
-        raise click.ClickException(reply["error"])
+        raise Error(reply["error"])
     return reply
 
 
-def running(store: Store) -> bool:
-    try:
-        daemon_call(store, timeout=5, cmd="status")
-        return True
-    except click.ClickException:
-        return False
-
-
-def fmt_msg(store: Store, m: Json) -> str:
-    who = "me → " + store.label(m["peer"]) if m["dir"] == "out" else store.label(m["peer"])
-    return f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(m['ts']))} [{who}] {m['text']}"
+def running() -> bool:
+    with suppress(Error):
+        return bool(call(timeout=5, cmd="status"))
+    return False
 
 
 @click.group()
-@click.option("--home", type=click.Path(path_type=Path), envvar="P2PCHAT_HOME",
-              default=Path.home() / ".p2pchat", show_default=True, help="Data dir (one per identity).")
-@click.pass_context
-def cli(ctx: click.Context, home: Path) -> None:
-    """Minimal libp2p chat. Wherever PEER is expected you may pass a peer ID, a username or a nickname."""
-    ctx.obj = Store(home)
+@click.option("--home", type=click.Path(path_type=Path), envvar="P2PCHAT_HOME", default=Path.home() / ".p2pchat",
+              show_default=True, help="Data dir (one per identity).")
+def cli(home: Path) -> None:
+    global store
+    store = Store(home)
 
 
 @cli.command()
 @click.option("-p", "--port", default=4777, show_default=True)
 @click.option("-b", "--bootstrap", multiple=True, help="Multiaddr (with /p2p/ID) of a peer to join through.")
-@click.option("-d", "--detach", is_flag=True, help="Run in the background and return immediately.")
-@click.option("--no-mdns", is_flag=True, help="Disable automatic LAN discovery.")
-@click.option("--private", is_flag=True, help="Don't join the public IPFS DHT (only LAN/--bootstrap peers).")
-@click.option("-v", "--verbose", count=True, help="-v: info logging, -vv: full libp2p debug logging.")
-@click.pass_obj
-def start(store: Store, port: int, bootstrap: tuple[str, ...], detach: bool, no_mdns: bool, private: bool,
-          verbose: int) -> None:
-    """Start the chat node (foreground prints incoming messages; -d detaches)."""
-    if running(store):
-        raise click.ClickException("a node is already running for this --home")
-    if detach:
-        args = [sys.executable, __file__, "--home", str(store.home), "start", "-p", str(port)]
-        args += [x for b in bootstrap for x in ("-b", b)] + ["-v"] * verbose
-        args += (["--no-mdns"] if no_mdns else []) + (["--private"] if private else [])
-        with open(store.home / "daemon.log", "a") as logfile:
-            subprocess.Popen(args, stdout=logfile, stderr=logfile, stdin=subprocess.DEVNULL, start_new_session=True)
+@click.option("-d", "--detach", is_flag=True, help="Run in the background.")
+@click.option("--no-mdns", is_flag=True, help="Disable LAN discovery.")
+@click.option("--private", is_flag=True, help="Don't join the public IPFS DHT.")
+@click.option("-v", "--verbose", count=True, help="-v info, -vv libp2p debug.")
+def start(port: int, bootstrap: tuple[str, ...], detach: bool, no_mdns: bool, private: bool, verbose: int) -> None:
+    if running():
+        raise Error("a node is already running for this --home")
+    if detach and not os.environ.get("P2PCHAT_DAEMON"):
+        with open(logfile := store.home / "daemon.log", "a") as out:
+            subprocess.Popen([sys.executable, *sys.argv], env=os.environ | {"P2PCHAT_DAEMON": "1"},
+                             stdout=out, stderr=out, stdin=subprocess.DEVNULL, start_new_session=True)
         for _ in range(300):
             time.sleep(0.2)
-            if running(store):
-                click.echo(f"started in background, peer id: {daemon_call(store, cmd='status')['id']}")
-                return
-        raise click.ClickException(f"daemon failed to start, see {store.home / 'daemon.log'}")
-    level = {0: logging.CRITICAL, 1: logging.INFO}.get(verbose, logging.DEBUG)
-    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    logging.getLogger("libp2p").setLevel(level if verbose > 1 else logging.CRITICAL)
-    logging.getLogger("libp2p").propagate = verbose > 1  # libp2p silences itself unless LIBP2P_DEBUG is set
-    while True:  # supervise: a crash inside libp2p restarts the node instead of killing the daemon
-        node = Node(store, port, list(bootstrap), echo=True, mdns=not no_mdns, public=not private)
+            if running():
+                return echo(f"started in background, peer id: {call(cmd='status')['id']}")
+        raise Error(f"daemon failed to start, see {logfile}")
+    logging.basicConfig(level=[50, 20, 10][min(verbose, 2)], format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    (lib := logging.getLogger("libp2p")).setLevel(10 if verbose > 1 else 50)
+    lib.propagate = verbose > 1
+    while True:
+        node = Node(store, port, list(bootstrap), not no_mdns, not private)
         try:
-            trio.run(node.run)
-            return  # clean `stop`
+            return trio.run(node.run)
         except KeyboardInterrupt:
             return
         except BaseException as e:
@@ -793,142 +566,104 @@ def start(store: Store, port: int, bootstrap: tuple[str, ...], detach: bool, no_
 
 
 @cli.command()
-@click.pass_obj
-def stop(store: Store) -> None:
-    """Stop the background node."""
-    daemon_call(store, cmd="stop")
-    click.echo("stopped")
+def stop() -> None:
+    call(cmd="stop")
+    echo("stopped")
 
 
 @cli.command()
-@click.pass_obj
-def status(store: Store) -> None:
-    """Show own peer ID, addresses and connected peers."""
-    r = daemon_call(store, cmd="status")
-    click.echo(f"peer id:      {r['id']}\nusername:     {store.config()['username'] or '-'}\n"
-               f"reachability: {r['reachability']}\ndht:          {r['dht']}\nconnections:  {r['connections']}")
-    for p in r["relays"]:
-        click.echo(f"relay:        {store.label(p) if p in store.peers() else p}")
-    for a in r["addrs"]:
-        click.echo(f"addr:         {a}")
-    for p, link in r["connected"]:
-        click.echo(f"online:       {store.label(p)} ({p}) [{link}]")
+def status() -> None:
+    echo(call(cmd="status")["text"])
 
 
 @cli.command()
 @click.argument("name", required=False)
-@click.pass_obj
-def username(store: Store, name: str | None) -> None:
-    """Show or set the username you present to peers you meet."""
+def username(name: str | None) -> None:
     if name is not None:
-        store.set_config(username=name)
-    click.echo(store.config()["username"] or "(no username set)")
+        store.configure(username=name)
+    echo(store.config()["username"] or "(no username set)")
 
 
 @cli.command()
-@click.argument("peer")
+@peer_arg
 @click.argument("name", required=False)
-@click.pass_obj
-def nick(store: Store, peer: str, name: str | None) -> None:
-    """Locally nickname PEER (overrides their own username). Omit NAME to remove the nickname."""
+def nick(peer: str, name: str | None) -> None:
     pid, nicks = store.resolve(peer), store.config()["nicks"]
     if name:
         nicks[pid] = name
     else:
         nicks.pop(pid, None)
-    store.set_config(nicks=nicks)
-    click.echo(f"{pid} -> {name or '(nickname removed)'}")
+    store.configure(nicks=nicks)
+    echo(f"{pid} -> {name or '(nickname removed)'}")
 
 
 @cli.command()
-@click.argument("peer")
+@peer_arg
 @click.argument("message", nargs=-1, required=True)
-@click.pass_obj
-def send(store: Store, peer: str, message: tuple[str, ...]) -> None:
-    """Send MESSAGE to PEER (found by ID via known peers, peer exchange and the DHT)."""
-    pid = store.resolve(peer)
-    if pid in store.config()["blocked"]:
-        raise click.ClickException("that peer is blocked; unblock it first")
-    daemon_call(store, cmd="send", peer=pid, text=" ".join(message))
-    click.echo(f"sent to {store.label(pid)}")
+def send(peer: str, message: tuple[str, ...]) -> None:
+    if store.blocked(pid := store.resolve(peer)):
+        raise Error("that peer is blocked; unblock it first")
+    call(cmd="send", peer=pid, text=" ".join(message))
+    echo(f"sent to {store.label(pid)}")
 
 
 @cli.command()
 @click.argument("peer", required=False)
-@click.option("-n", "--last", default=20, show_default=True, help="Number of messages to show.")
+@click.option("-n", "--last", default=20, show_default=True, help="Messages to show.")
 @click.option("-f", "--follow", is_flag=True, help="Keep printing new messages.")
-@click.pass_obj
-def read(store: Store, peer: str | None, last: int, follow: bool) -> None:
-    """Read messages, optionally only the conversation with PEER."""
+def read(peer: str | None, last: int, follow: bool) -> None:
     pid = store.resolve(peer) if peer else None
-    msgs = [m for m in store.messages() if pid in (None, m["peer"]) and m["peer"] not in store.config()["blocked"]]
-    for m in msgs[-last:] if last else msgs:
-        click.echo(fmt_msg(store, m))
-    seen = len(store.messages())
-    while follow:
+    count = 0
+    while True:
+        msgs = store.messages()
+        for m in [m for m in msgs[count:] if pid in (None, m["peer"]) and not store.blocked(m["peer"])][-last:]:
+            who = ("me → " if m["dir"] == "out" else "") + store.label(m["peer"])
+            echo(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(m['ts']))} [{who}] {m['text']}")
+        if not follow:
+            break
+        count, last = len(msgs), 0
         time.sleep(1)
-        new = store.messages()[seen:]
-        seen += len(new)
-        for m in new:
-            if pid in (None, m["peer"]) and m["peer"] not in store.config()["blocked"]:
-                click.echo(fmt_msg(store, m))
 
 
 @cli.command()
-@click.option("--from", "source", metavar="PEER", help="Ask PEER for the peers it has encountered instead.")
+@click.option("--from", "source", metavar="PEER", help="Ask PEER for the peers it has met.")
 @click.option("--named", is_flag=True, help="Only peers with a username or nickname.")
-@click.pass_obj
-def peers(store: Store, source: str | None, named: bool) -> None:
-    """List encountered peers with their usernames and your nicknames."""
-    cfg = store.config()
-    if source:
-        rows = {p["id"]: p for p in daemon_call(store, cmd="peers", peer=store.resolve(source))["peers"]}
-    else:
-        rows = store.peers()
+def peers(source: str | None, named: bool) -> None:
+    nicks = store.config()["nicks"]
+    rows = {p["id"]: p for p in call(cmd="peers", peer=store.resolve(source))["peers"]} if source else store.peers()
     for pid, p in rows.items():
-        nickname, name = cfg["nicks"].get(pid, ""), p.get("name", "")
-        if named and not (nickname or name):
-            continue
-        flags = " [blocked]" if pid in cfg["blocked"] else ""
-        click.echo(f"{pid}  username={name or '-'}  nick={nickname or '-'}{flags}")
+        nickname, name = nicks.get(pid, ""), p.get("name", "")
+        if nickname or name or not named:
+            echo(f"{pid}  username={name or '-'}  nick={nickname or '-'}" + " [blocked]" * store.blocked(pid))
 
 
 @cli.command()
-@click.argument("peer")
-@click.pass_obj
-def find(store: Store, peer: str) -> None:
-    """Locate and connect to PEER by its ID."""
+@peer_arg
+def find(peer: str) -> None:
+    call(cmd="find", peer=(pid := store.resolve(peer)))
+    echo(f"connected to {store.label(pid)}")
+
+
+@cli.command()
+@peer_arg
+def block(peer: str) -> None:
     pid = store.resolve(peer)
-    daemon_call(store, cmd="find", peer=pid)
-    click.echo(f"connected to {store.label(pid)}")
+    store.configure(blocked=sorted({*store.config()["blocked"], pid}))
+    echo(f"blocked {pid}")
 
 
 @cli.command()
-@click.argument("peer")
-@click.pass_obj
-def block(store: Store, peer: str) -> None:
-    """Block PEER: drop its messages and refuse its requests."""
+@peer_arg
+def unblock(peer: str) -> None:
     pid = store.resolve(peer)
-    store.set_config(blocked=sorted({*store.config()["blocked"], pid}))
-    click.echo(f"blocked {pid}")
+    store.configure(blocked=sorted({*store.config()["blocked"]} - {pid}))
+    echo(f"unblocked {pid}")
 
 
 @cli.command()
-@click.argument("peer")
-@click.pass_obj
-def unblock(store: Store, peer: str) -> None:
-    """Unblock PEER."""
-    pid = store.resolve(peer)
-    store.set_config(blocked=[b for b in store.config()["blocked"] if b != pid])
-    click.echo(f"unblocked {pid}")
-
-
-@cli.command()
-@click.pass_obj
-def blocked(store: Store) -> None:
-    """List blocked peers."""
+def blocked() -> None:
     for pid in store.config()["blocked"]:
-        click.echo(f"{pid}  {store.label(pid)}")
+        echo(f"{pid}  {store.label(pid)}")
 
 
 if __name__ == "__main__":
