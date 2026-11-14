@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-# p2pchat - peer-to-peer chat over libp2p
+# gnosis-mesh - peer-to-peer chat over libp2p
 # Copyright (C) 2026 muntedcrocodile
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero
@@ -61,7 +61,7 @@ from libp2p.utils.address_validation import _safe_get_network_addrs, is_ipv6_ava
 from multiaddr import Multiaddr
 from multiaddr.protocols import P_P2P
 
-PROTO = TProtocol("/p2pchat/1.0.0")
+PROTO = TProtocol("/gnosis-mesh/1.0.0")
 MAX_MSG = 1 << 20
 RELAY_TARGET = 3  # public relay reservations to hold while behind NAT
 IPFS_BOOTSTRAP = [  # public IPFS DHT entry points (Kubo defaults)
@@ -74,7 +74,7 @@ IPFS_BOOTSTRAP = [  # public IPFS DHT entry points (Kubo defaults)
     "/ip4/104.131.131.82/udp/4001/quic-v1/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
 ]
 Json = dict[str, Any]
-log = logging.getLogger("p2pchat")
+log = logging.getLogger("gnosis-mesh")
 
 
 # ---------- local storage (config.json is written by the CLI, peers.json + messages.jsonl by the daemon) ----------
@@ -85,7 +85,7 @@ class Store:
         home.mkdir(parents=True, exist_ok=True)
         # AF_UNIX socket paths are limited to 108 bytes on Linux and 104 on macOS: use the first runtime dir whose
         # socket path fits (/tmp always does), so a long $XDG_RUNTIME_DIR or $TMPDIR can't stop the node starting.
-        name = f"p2pchat-{hashlib.sha1(str(home.resolve()).encode()).hexdigest()[:12]}.sock"
+        name = f"gnosis-mesh-{hashlib.sha1(str(home.resolve()).encode()).hexdigest()[:12]}.sock"
         for run_dir in (os.environ.get("XDG_RUNTIME_DIR"), tempfile.gettempdir(), "/tmp"):
             self.sock = os.path.join(run_dir or "/tmp", name)
             if len(self.sock.encode()) < 104:
@@ -198,7 +198,7 @@ def addr_order(addr: Multiaddr) -> tuple[bool, bool, int, bool]:
 
 def rendezvous_key(pid: str) -> str:
     """DHT provider key (hex sha256 multihash) under which a peer announces its addresses."""
-    return "1220" + hashlib.sha256(f"p2pchat:{pid}".encode()).hexdigest()
+    return "1220" + hashlib.sha256(f"gnosis-mesh:{pid}".encode()).hexdigest()
 
 
 class Node:
@@ -315,7 +315,7 @@ class Node:
             entry["name"] = name
         self.store.save_peers(peers)
 
-    # --- the /p2pchat protocol: one JSON request + one JSON reply per stream ---
+    # --- the /gnosis-mesh protocol: one JSON request + one JSON reply per stream ---
     async def handle(self, stream: INetStream) -> None:
         pid = stream.muxed_conn.peer_id
         if self.blocked(pid.to_base58()):
@@ -723,7 +723,7 @@ def daemon_call(store: Store, timeout: float = 90, **req: Any) -> Json:
             while not buf.endswith(b"\n") and (chunk := s.recv(65536)):
                 buf += chunk
     except (FileNotFoundError, ConnectionRefusedError):
-        raise click.ClickException("daemon is not running; start it with `p2pchat.py start -d`")
+        raise click.ClickException("daemon is not running; start it with `gnosis_mesh.py start -d`")
     except TimeoutError:
         raise click.ClickException("daemon did not respond in time")
     reply = json.loads(buf)
@@ -746,8 +746,8 @@ def fmt_msg(store: Store, m: Json) -> str:
 
 
 @click.group()
-@click.option("--home", type=click.Path(path_type=Path), envvar="P2PCHAT_HOME",
-              default=Path.home() / ".p2pchat", show_default=True, help="Data dir (one per identity).")
+@click.option("--home", type=click.Path(path_type=Path), envvar="GNOSIS_MESH_HOME",
+              default=Path.home() / ".gnosis-mesh", show_default=True, help="Data dir (one per identity).")
 @click.pass_context
 def cli(ctx: click.Context, home: Path) -> None:
     """Minimal libp2p chat. Wherever PEER is expected you may pass a peer ID, a username or a nickname."""

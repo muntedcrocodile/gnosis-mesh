@@ -1,20 +1,20 @@
-# p2pchat
+# gnosis-mesh
 
 A small peer-to-peer chat for the terminal, built on [py-libp2p](https://github.com/libp2p/py-libp2p).
 There are no servers and no accounts: you message people by their **libp2p peer ID**, and the app finds them
 through the public IPFS DHT, the local network, or peers you both know. It also gets through NATs and firewalls
 where it can.
 
-Everything lives in one file, `p2pchat.py`. It contains a background node (daemon) and a command-line interface
+Everything lives in one file, `gnosis_mesh.py`. It contains a background node (daemon) and a command-line interface
 built with [click](https://click.palletsprojects.com/).
 
 ```text
-$ p2pchat.py username alice
-$ p2pchat.py start -d
+$ gnosis_mesh.py username alice
+$ gnosis_mesh.py start -d
 started in background, peer id: 12D3KooWQbUFXhUhcSBiPWuyXNjLaSvDt6wFEiD1TDF34JFecsjB
-$ p2pchat.py send 12D3KooWEptJT6b8abshyeWdxC52WvkHUcf6Z7xsAQV2QCbKhZsk hi bob
+$ gnosis_mesh.py send 12D3KooWEptJT6b8abshyeWdxC52WvkHUcf6Z7xsAQV2QCbKhZsk hi bob
 sent to bob
-$ p2pchat.py read
+$ gnosis_mesh.py read
 2026-11-15 00:29:23 [me → bob] hi bob
 2026-11-15 00:29:31 [bob] hey alice!
 ```
@@ -66,7 +66,7 @@ python3 -m venv .venv
 The examples below assume an alias:
 
 ```bash
-alias p2pchat="$PWD/.venv/bin/python $PWD/p2pchat.py"
+alias gnosis-mesh="$PWD/.venv/bin/python $PWD/gnosis_mesh.py"
 ```
 
 ---
@@ -74,23 +74,23 @@ alias p2pchat="$PWD/.venv/bin/python $PWD/p2pchat.py"
 ## Quick start
 
 ```bash
-p2pchat username alice      # choose the name other peers will see (optional)
-p2pchat start -d            # start the node in the background; prints your peer ID
-p2pchat status              # your peer ID, addresses, relays and who's online
+gnosis-mesh username alice      # choose the name other peers will see (optional)
+gnosis-mesh start -d            # start the node in the background; prints your peer ID
+gnosis-mesh status              # your peer ID, addresses, relays and who's online
 ```
 
 Give your peer ID to a friend. Once they're running a node too:
 
 ```bash
-p2pchat send 12D3KooW...theirID... hello!   # the first message finds them by ID
-p2pchat nick 12D3KooW...theirID... bob      # optional: your own name for them
-p2pchat send bob how are you?               # nicknames and usernames work anywhere a peer is expected
-p2pchat read bob                            # your conversation with bob
-p2pchat read -f                             # follow all incoming messages live
-p2pchat stop
+gnosis-mesh send 12D3KooW...theirID... hello!   # the first message finds them by ID
+gnosis-mesh nick 12D3KooW...theirID... bob      # optional: your own name for them
+gnosis-mesh send bob how are you?               # nicknames and usernames work anywhere a peer is expected
+gnosis-mesh read bob                            # your conversation with bob
+gnosis-mesh read -f                             # follow all incoming messages live
+gnosis-mesh stop
 ```
 
-Run `p2pchat start` without `-d` to keep the node in the foreground. It then prints incoming messages as they
+Run `gnosis-mesh start` without `-d` to keep the node in the foreground. It then prints incoming messages as they
 arrive.
 
 ---
@@ -113,7 +113,7 @@ Wherever `PEER` appears, you can give a **peer ID**, a **username** or a **nickn
 | `find PEER` | Locate and connect to PEER without sending anything. |
 | `block PEER` / `unblock PEER` / `blocked` | Manage your block list. |
 
-All commands accept `--home DIR` (or the `P2PCHAT_HOME` environment variable) to choose the data directory.
+All commands accept `--home DIR` (or the `GNOSIS_MESH_HOME` environment variable) to choose the data directory.
 See [Running several identities](#running-several-identities).
 
 `username`, `nick`, `block`, `read` and `peers` (without `--from`) work even when the node isn't running.
@@ -122,9 +122,9 @@ See [Running several identities](#running-several-identities).
 
 ## Names: usernames and nicknames
 
-- A **username** is what a peer calls itself (`p2pchat username alice`). Every request includes it, so peers
+- A **username** is what a peer calls itself (`gnosis-mesh username alice`). Every request includes it, so peers
   learn it as soon as they meet you, and they see changes the next time you talk.
-- A **nickname** is what *you* call a peer (`p2pchat nick <peer> bob`). It's stored only on your machine and
+- A **nickname** is what *you* call a peer (`gnosis-mesh nick <peer> bob`). It's stored only on your machine and
   always takes priority over their username in output and when resolving names.
 
 When you pass a name to any command, the CLI resolves it in this order:
@@ -212,11 +212,11 @@ What keeps this working:
 Each identity is a data directory. Give each one its own `--home` and port:
 
 ```bash
-p2pchat --home ~/.p2pchat-work start -d -p 4778
-P2PCHAT_HOME=~/.p2pchat-work p2pchat status
+gnosis-mesh --home ~/.gnosis-mesh-work start -d -p 4778
+GNOSIS_MESH_HOME=~/.gnosis-mesh-work gnosis-mesh status
 ```
 
-The default is `~/.p2pchat` on port 4777. The port is used for TCP and for UDP (QUIC).
+The default is `~/.gnosis-mesh` on port 4777. The port is used for TCP and for UDP (QUIC).
 
 ### Files in the data directory
 
@@ -239,7 +239,7 @@ or the system temp directory if that isn't set. If the resulting path would be t
 - **Connections are encrypted and authenticated end to end** with Noise (QUIC uses TLS 1.3). Your peer ID *is*
   your public key, so nobody can impersonate a peer ID without its `key` file. Relayed connections are encrypted
   end to end as well, so relays can't read your messages. py-libp2p also offers unencrypted (plaintext) and
-  deprecated (SECIO) security by default; p2pchat turns both off.
+  deprecated (SECIO) security by default; gnosis-mesh turns both off.
 - **Message history and settings are stored unencrypted** in the data directory.
 - **Joining the public DHT makes your peer ID and addresses public.** Anyone can look you up and see your IP
   addresses or your relay addresses. Use `--private` if that's a problem.
@@ -253,7 +253,7 @@ or the system temp directory if that isn't set. If the resulting path would be t
 
 ## Protocol
 
-Chat traffic uses the libp2p protocol `/p2pchat/1.0.0`. Each exchange opens one stream, sends one JSON request
+Chat traffic uses the libp2p protocol `/gnosis-mesh/1.0.0`. Each exchange opens one stream, sends one JSON request
 and closes its write side, then reads one JSON reply:
 
 ```jsonc
@@ -266,13 +266,13 @@ and closes its write side, then reads one JSON reply:
 `name` is the sender's current username (an empty string if it hasn't set one). A blocked peer's streams are
 reset without a reply.
 
-The provider record key for a peer is the sha256 multihash of `p2pchat:<peer ID>`.
+The provider record key for a peer is the sha256 multihash of `gnosis-mesh:<peer ID>`.
 
 ---
 
 ## Troubleshooting
 
-- **"daemon is not running".** Start one with `p2pchat start -d`, and check you're using the same `--home`.
+- **"daemon is not running".** Start one with `gnosis-mesh start -d`, and check you're using the same `--home`.
 - **"could not reach …".** The peer may be offline, or (for a peer you've never met) not yet announced: give a
   freshly started node about a minute. Run the node with `-v` and check `daemon.log`; the
   `could not connect to …` lines show what was tried and why each attempt failed.
@@ -300,7 +300,7 @@ The provider record key for a peer is the sha256 multihash of `p2pchat:<peer ID>
 
 ### py-libp2p workarounds
 
-`p2pchat.py` works around several py-libp2p 0.8.1 issues. Each one is commented in the code:
+`gnosis_mesh.py` works around several py-libp2p 0.8.1 issues. Each one is commented in the code:
 
 - `BasicHost.get_addrs()` mangles `/p2p-circuit` addresses, so the node builds its advertised address list
   itself.
@@ -325,7 +325,7 @@ The provider record key for a peer is the sha256 multihash of `p2pchat:<peer ID>
 
 Copyright (C) 2026 muntedcrocodile.
 
-p2pchat is free software: you can redistribute it and/or modify it under the terms of the
+gnosis-mesh is free software: you can redistribute it and/or modify it under the terms of the
 [GNU Affero General Public License, version 3](LICENSE) (`AGPL-3.0-only`), as published by the Free Software
 Foundation.
 
