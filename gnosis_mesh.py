@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import ipaddress
 import json
@@ -23,11 +24,12 @@ import os
 import queue
 import random
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +67,8 @@ PROTO = TProtocol("/gnosis-mesh/1.0.0")
 MAX_MSG = 1 << 20
 RELAY_TARGET = 3  # public relay reservations to hold while behind NAT
 MESH_TARGET = 8  # chat peers to stay connected to; below this, discover() looks for more
+DIAL_ON_START = 64  # most recently seen known peers to reconnect to when the node starts
+PEX_LIMIT = 200  # most recently seen peers to share in a "peers" reply (keeps it well under MAX_MSG)
 IPFS_BOOTSTRAP = [  # public IPFS DHT entry points (Kubo defaults)
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
@@ -78,41 +82,221 @@ Json = dict[str, Any]
 log = logging.getLogger("gnosis-mesh")
 
 
-# ---------- local storage (config.json is written by the CLI, peers.json + messages.jsonl by the daemon) ----------
+# ---------- local storage: store.db (SQLite, WAL) shared by the CLI and the daemon; the identity seed stays in `key` ----------
+
+SCHEMA = """
+CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;  -- JSON values, e.g. username
+CREATE TABLE nicks (pid TEXT PRIMARY KEY, nick TEXT NOT NULL) WITHOUT ROWID;
+CREATE INDEX nicks_nick ON nicks (nick);
+CREATE TABLE blocked (pid TEXT PRIMARY KEY) WITHOUT ROWID;
+CREATE TABLE peers (pid TEXT NOT NULL UNIQUE, name TEXT, addrs TEXT NOT NULL DEFAULT '[]', seen REAL NOT NULL);
+CREATE INDEX peers_seen ON peers (seen);
+CREATE INDEX peers_name ON peers (name);
+CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, peer TEXT NOT NULL,
+                       dir TEXT NOT NULL CHECK (dir IN ('in', 'out')), text TEXT NOT NULL);
+CREATE INDEX messages_peer ON messages (peer, id);
+"""
+SCHEMA_VERSION = 1
+LEGACY_FILES = ("config.json", "peers.json", "messages.jsonl")
+
+
+def socket_path(home: Path) -> str:
+    """The daemon's control socket for a data dir.
+    AF_UNIX socket paths are limited to 108 bytes on Linux and 104 on macOS: use the first runtime dir whose
+    socket path fits (/tmp always does), so a long $XDG_RUNTIME_DIR or $TMPDIR can't stop the node starting."""
+    name = f"gnosis-mesh-{hashlib.sha1(str(home.resolve()).encode()).hexdigest()[:12]}.sock"
+    for run_dir in (os.environ.get("XDG_RUNTIME_DIR"), tempfile.gettempdir(), "/tmp"):
+        path = os.path.join(run_dir or "/tmp", name)
+        if len(path.encode()) < 104:
+            return path
+    return path
+
 
 class Store:
+    PEER_TTL = 30 * 86400  # forget strangers not seen for this long...
+    MAX_PEERS = 2000  # ...and keep at most this many (nicknamed peers and correspondents are never pruned)
+    PRUNE_EVERY = 3600  # the daemon prunes opportunistically from remember_peer at most this often
+
     def __init__(self, home: Path) -> None:
         self.home = home
         home.mkdir(parents=True, exist_ok=True)
-        # AF_UNIX socket paths are limited to 108 bytes on Linux and 104 on macOS: use the first runtime dir whose
-        # socket path fits (/tmp always does), so a long $XDG_RUNTIME_DIR or $TMPDIR can't stop the node starting.
-        name = f"gnosis-mesh-{hashlib.sha1(str(home.resolve()).encode()).hexdigest()[:12]}.sock"
-        for run_dir in (os.environ.get("XDG_RUNTIME_DIR"), tempfile.gettempdir(), "/tmp"):
-            self.sock = os.path.join(run_dir or "/tmp", name)
-            if len(self.sock.encode()) < 104:
-                break
+        self.sock = socket_path(home)
+        self.db_path = home / "store.db"
+        if not self.db_path.exists():  # messages are private: create the db (SQLite copies its mode to -wal/-shm) 0600
+            os.close(os.open(self.db_path, os.O_WRONLY | os.O_CREAT, 0o600))
+        # Autocommit; writes that must be atomic use _tx(). The CLI and the daemon each hold one connection and
+        # WAL lets readers proceed while one writer commits; busy_timeout covers the brief writer-vs-writer overlap.
+        self.db = sqlite3.connect(self.db_path, isolation_level=None, timeout=5)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=NORMAL")  # durable across app crashes; an OS crash may lose the last commit
+        self._last_prune = time.time()
+        self._migrate()
 
-    def _load(self, name: str) -> Json:
-        p = self.home / name
-        return json.loads(p.read_text()) if p.exists() else {}
+    def close(self) -> None:
+        self.db.close()
 
-    def _save(self, name: str, data: Json) -> None:
-        tmp = self.home / f".{name}.tmp"
-        tmp.write_text(json.dumps(data, indent=2))
-        tmp.replace(self.home / name)
+    @contextlib.contextmanager
+    def _tx(self) -> Iterator[sqlite3.Connection]:
+        """A write transaction that takes the write lock up front (so read-modify-write can't lose updates)."""
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            yield self.db
+        except BaseException:
+            self.db.execute("ROLLBACK")
+            raise
+        self.db.execute("COMMIT")
 
+    # --- schema + one-time import of the JSON files used before store.db ---
+    def _migrate(self) -> None:
+        if self.db.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
+            return
+        if any((self.home / name).exists() for name in LEGACY_FILES) and self._daemon_listening():
+            # an older daemon would keep writing the JSON files after we import them, and those writes would be lost
+            raise click.ClickException("a gnosis-mesh daemon from before store.db is running for this --home; "
+                                       "stop it (`gnosis_mesh.py stop` with the old version), then retry")
+        imported: list[str] = []
+        with self._tx() as db:  # the write lock serialises concurrent first runs: only one of them imports
+            if db.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
+                return
+            for stmt in filter(str.strip, SCHEMA.split(";")):  # not executescript: it would COMMIT our transaction
+                db.execute(stmt)
+            imported = self._import_legacy(db)
+            db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        for name in imported:  # only once the import is committed; the originals are kept as a backup
+            (self.home / name).replace(self.home / f"{name}.migrated")
+        if imported:
+            log.info("migrated %s into %s", ", ".join(imported), self.db_path)
+
+    def _daemon_listening(self) -> bool:
+        with socket.socket(socket.AF_UNIX) as sock:
+            sock.settimeout(1)
+            try:
+                sock.connect(self.sock)
+                return True
+            except OSError:  # no socket file, or a stale one nobody listens on
+                return False
+
+    def _import_legacy(self, db: sqlite3.Connection) -> list[str]:
+        imported: list[str] = []
+        if (p := self.home / "config.json").exists():
+            cfg = json.loads(p.read_text() or "{}")
+            db.executemany("INSERT OR REPLACE INTO nicks VALUES (?, ?)", (cfg.pop("nicks", None) or {}).items())
+            db.executemany("INSERT OR IGNORE INTO blocked VALUES (?)", ((b,) for b in cfg.pop("blocked", None) or []))
+            db.executemany("INSERT OR REPLACE INTO settings VALUES (?, ?)", ((k, json.dumps(v)) for k, v in cfg.items()))
+            imported.append(p.name)
+        if (p := self.home / "peers.json").exists():
+            peers = json.loads(p.read_text() or "{}")
+            db.executemany("INSERT OR REPLACE INTO peers (pid, name, addrs, seen) VALUES (?, ?, ?, ?)",
+                           ((pid, e.get("name"), json.dumps(e.get("addrs", [])), float(e.get("seen", 0)))
+                            for pid, e in peers.items()))
+            imported.append(p.name)
+        if (p := self.home / "messages.jsonl").exists():
+            rows, bad = [], 0
+            with open(p) as f:
+                for line in f:
+                    try:
+                        m = json.loads(line)
+                        rows.append((float(m["ts"]), m["peer"], m["dir"], m["text"]))
+                    except (ValueError, KeyError, TypeError):  # e.g. a line truncated by a crash mid-append
+                        bad += line.strip() != ""
+            db.executemany("INSERT INTO messages (ts, peer, dir, text) VALUES (?, ?, ?, ?)", rows)
+            if bad:
+                log.warning("skipped %d unreadable lines in %s", bad, p)
+            imported.append(p.name)
+        return imported
+
+    # --- config: username, nicknames, block list ---
     def config(self) -> Json:
-        return {"username": "", "nicks": {}, "blocked": [], **self._load("config.json")}
+        cfg: Json = {"username": "", **{r[0]: json.loads(r[1]) for r in self.db.execute("SELECT * FROM settings")}}
+        cfg["nicks"] = dict(self.db.execute("SELECT pid, nick FROM nicks").fetchall())
+        cfg["blocked"] = [r[0] for r in self.db.execute("SELECT pid FROM blocked ORDER BY pid")]
+        return cfg
 
     def set_config(self, **kw: Any) -> None:
-        self._save("config.json", {**self.config(), **kw})
+        """Replace the given config keys (nicks / blocked replace the whole mapping / list, as before)."""
+        with self._tx() as db:
+            if "nicks" in kw:
+                db.execute("DELETE FROM nicks")
+                db.executemany("INSERT INTO nicks VALUES (?, ?)", kw.pop("nicks").items())
+            if "blocked" in kw:
+                db.execute("DELETE FROM blocked")
+                db.executemany("INSERT OR IGNORE INTO blocked VALUES (?)", ((b,) for b in kw.pop("blocked")))
+            db.executemany("INSERT OR REPLACE INTO settings VALUES (?, ?)", ((k, json.dumps(v)) for k, v in kw.items()))
+
+    def username(self) -> str:
+        row = self.db.execute("SELECT value FROM settings WHERE key = 'username'").fetchone()
+        return json.loads(row[0]) if row else ""
+
+    def set_nick(self, pid: str, nick: str | None) -> None:
+        if nick:
+            self.db.execute("INSERT OR REPLACE INTO nicks VALUES (?, ?)", (pid, nick))
+        else:
+            self.db.execute("DELETE FROM nicks WHERE pid = ?", (pid,))
+
+    def is_blocked(self, pid: str) -> bool:
+        return self.db.execute("SELECT 1 FROM blocked WHERE pid = ?", (pid,)).fetchone() is not None
+
+    def block(self, pid: str) -> None:
+        self.db.execute("INSERT OR IGNORE INTO blocked VALUES (?)", (pid,))
+
+    def unblock(self, pid: str) -> None:
+        self.db.execute("DELETE FROM blocked WHERE pid = ?", (pid,))
+
+    # --- peers we've met ---
+    @staticmethod
+    def _peer(row: sqlite3.Row) -> Json:
+        entry: Json = {"addrs": json.loads(row["addrs"]), "seen": row["seen"]}
+        if row["name"] is not None:
+            entry["name"] = row["name"]
+        return entry
 
     def peers(self) -> Json:
-        return self._load("peers.json")
+        """Every remembered peer, {pid: {name?, addrs, seen}}, in the order first met (prefer recent_peers)."""
+        return {r["pid"]: self._peer(r) for r in self.db.execute("SELECT * FROM peers ORDER BY rowid")}
+
+    def recent_peers(self, limit: int, exclude_blocked: bool = False) -> Json:
+        """The `limit` most recently seen peers, newest first."""
+        where = "WHERE pid NOT IN (SELECT pid FROM blocked)" if exclude_blocked else ""
+        rows = self.db.execute(f"SELECT * FROM peers {where} ORDER BY seen DESC LIMIT ?", (limit,))
+        return {r["pid"]: self._peer(r) for r in rows}
+
+    def has_peer(self, pid: str) -> bool:
+        return self.db.execute("SELECT 1 FROM peers WHERE pid = ?", (pid,)).fetchone() is not None
 
     def save_peers(self, peers: Json) -> None:
-        self._save("peers.json", peers)
+        """Replace the whole peer table (kept for compatibility; remember_peer is the race-free way to update)."""
+        with self._tx() as db:
+            db.execute("DELETE FROM peers")
+            db.executemany("INSERT INTO peers (pid, name, addrs, seen) VALUES (?, ?, ?, ?)",
+                           ((pid, e.get("name"), json.dumps(e.get("addrs", [])), float(e.get("seen", 0)))
+                            for pid, e in peers.items()))
 
+    def remember_peer(self, pid: str, addrs: list[str], name: str | None, seen: float | None = None) -> None:
+        """Upsert one peer atomically: keep its old name/addrs when none are given, always bump `seen`."""
+        self.db.execute(
+            "INSERT INTO peers (pid, name, addrs, seen) VALUES (?, ?, ?, ?) ON CONFLICT (pid) DO UPDATE SET "
+            "name = coalesce(excluded.name, name), "
+            "addrs = CASE excluded.addrs WHEN '[]' THEN addrs ELSE excluded.addrs END, seen = excluded.seen",
+            (pid, name or None, json.dumps(addrs), time.time() if seen is None else seen))
+        if time.time() - self._last_prune > self.PRUNE_EVERY:
+            self.prune_peers()
+
+    def prune_peers(self, ttl: float | None = None, keep: int | None = None) -> int:
+        """Forget strangers: peers unseen for `ttl` seconds, then all but the `keep` most recently seen. Peers you
+        nicknamed or exchanged messages with are never pruned. Returns how many were removed."""
+        ttl, keep = self.PEER_TTL if ttl is None else ttl, self.MAX_PEERS if keep is None else keep
+        kept = "pid NOT IN (SELECT pid FROM nicks) AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.peer = pid)"
+        self._last_prune = time.time()
+        with self._tx() as db:
+            n = db.execute(f"DELETE FROM peers WHERE seen < ? AND {kept}", (time.time() - ttl,)).rowcount
+            n += db.execute(f"DELETE FROM peers WHERE {kept} AND rowid NOT IN "
+                            "(SELECT rowid FROM peers ORDER BY seen DESC LIMIT ?)", (keep,)).rowcount
+        if n:
+            log.info("pruned %d stale peers", n)
+        return n
+
+    # --- identity ---
     def key_seed(self) -> bytes:
         p = self.home / "key"
         if not p.exists():
@@ -120,25 +304,38 @@ class Store:
             p.chmod(0o600)
         return p.read_bytes()
 
+    # --- message history ---
     def log_message(self, peer: str, direction: str, text: str) -> None:
-        with open(self.home / "messages.jsonl", "a") as f:
-            f.write(json.dumps({"ts": time.time(), "peer": peer, "dir": direction, "text": text}) + "\n")
+        self.db.execute("INSERT INTO messages (ts, peer, dir, text) VALUES (?, ?, ?, ?)",
+                        (time.time(), peer, direction, text))
 
-    def messages(self) -> list[Json]:
-        p = self.home / "messages.jsonl"
-        return [json.loads(line) for line in p.read_text().splitlines() if line] if p.exists() else []
+    def messages(self, peer: str | None = None, last: int | None = None, after: int = 0,
+                 include_blocked: bool = True) -> list[Json]:
+        """History in order, as {id, ts, peer, dir, text}: optionally one peer's, only the `last` N, only those with
+        id > `after` (for following), without blocked peers. No arguments returns everything, as before."""
+        where, args = ["id > ?"], [after]
+        if peer is not None:
+            where.append("peer = ?")
+            args.append(peer)
+        if not include_blocked:
+            where.append("peer NOT IN (SELECT pid FROM blocked)")
+        sql = f"SELECT * FROM messages WHERE {' AND '.join(where)} ORDER BY id"
+        if last:
+            sql = f"SELECT * FROM ({sql} DESC LIMIT ?) ORDER BY id"
+            args.append(last)
+        return [dict(r) for r in self.db.execute(sql, args)]
 
+    # --- names ---
     def label(self, pid: str) -> str:
-        nick = self.config()["nicks"].get(pid)
-        name = self.peers().get(pid, {}).get("name")
-        return nick or name or f"{pid[:6]}…{pid[-6:]}"
+        nick = self.db.execute("SELECT nick FROM nicks WHERE pid = ?", (pid,)).fetchone()
+        name = self.db.execute("SELECT name FROM peers WHERE pid = ?", (pid,)).fetchone()
+        return (nick and nick[0]) or (name and name[0]) or f"{pid[:6]}…{pid[-6:]}"
 
     def resolve(self, who: str) -> str:
         """Map a nickname, username or peer ID to a peer ID (local nicknames win over self-chosen usernames)."""
-        for pid, nick in self.config()["nicks"].items():
-            if nick == who:
-                return pid
-        named = [pid for pid, p in self.peers().items() if p.get("name") == who]
+        if nicked := self.db.execute("SELECT pid FROM nicks WHERE nick = ? LIMIT 1", (who,)).fetchone():
+            return nicked[0]
+        named = [r[0] for r in self.db.execute("SELECT pid FROM peers WHERE name = ? ORDER BY rowid", (who,))]
         if len(named) > 1:
             raise click.ClickException(f"username '{who}' is ambiguous ({', '.join(named)}); use a peer ID or nickname")
         if named:
@@ -309,17 +506,11 @@ class Node:
         return "relayed"
 
     def blocked(self, pid: str) -> bool:
-        return pid in self.store.config()["blocked"]
+        return self.store.is_blocked(pid)
 
     def remember(self, pid: ID, name: str | None) -> None:
-        """Record an encountered chat peer (with its self-assigned username) in peers.json."""
-        peers = self.store.peers()
-        entry = peers.setdefault(pid.to_base58(), {})
-        addrs = [str(a) for a in self.addrs(pid)]
-        entry.update(addrs=addrs or entry.get("addrs", []), seen=time.time())
-        if name:
-            entry["name"] = name
-        self.store.save_peers(peers)
+        """Record an encountered chat peer (with its self-assigned username) in the store."""
+        self.store.remember_peer(pid.to_base58(), [str(a) for a in self.addrs(pid)], name)
 
     # --- the /gnosis-mesh protocol: one JSON request + one JSON reply per stream ---
     async def handle(self, stream: INetStream) -> None:
@@ -336,8 +527,8 @@ class Node:
                 if self.echo:
                     click.echo(f"\n[{self.store.label(pid.to_base58())}] {req['text']}")
             elif req["t"] == "peers":
-                reply["peers"] = [{"id": k, **v} for k, v in self.store.peers().items()
-                                  if k != pid.to_base58() and not self.blocked(k)]
+                reply["peers"] = [{"id": k, **v} for k, v in self.store.recent_peers(PEX_LIMIT, exclude_blocked=True).items()
+                                  if k != pid.to_base58()]
             await stream.write(json.dumps(reply).encode())
             await stream.close()
             self.greeted.add(pid)
@@ -448,7 +639,7 @@ class Node:
             return True
         async with trio.open_nursery() as n:
             for other in self.host.get_connected_peers():
-                if other.to_base58() in self.store.peers():
+                if self.store.has_peer(other.to_base58()):
                     n.start_soon(self.greet, other, "peers")
         if await self.try_connect(pid):
             return True
@@ -680,10 +871,9 @@ class Node:
                     continue  # e.g. /dnsaddr: resolved by libp2p's bootstrap discovery instead
                 self.learn(info.peer_id, [str(a) for a in info.addrs])
                 n.start_soon(self.try_connect, info.peer_id)
-            for known, p in self.store.peers().items():
-                if not self.blocked(known):
-                    self.learn(ID.from_base58(known), p.get("addrs", []))
-                    n.start_soon(self.try_connect, ID.from_base58(known))
+            for known, p in self.store.recent_peers(DIAL_ON_START, exclude_blocked=True).items():
+                self.learn(ID.from_base58(known), p.get("addrs", []))
+                n.start_soon(self.try_connect, ID.from_base58(known))
             n.start_soon(self.maintain)
             seen: set[ID] = set()
             while True:
@@ -728,7 +918,7 @@ class Node:
                         self.reachability, "unknown"),
                     "dht": f"{self.dht.mode.value}, {self.dht.get_routing_table_size()} peers in routing table",
                     "relays": [p.to_base58() for p in self.reserved_relays()], "connections": len(conns),
-                    "connected": [[p.to_base58(), self.link(p)] for p in conns if p.to_base58() in self.store.peers()]}
+                    "connected": [[p.to_base58(), self.link(p)] for p in conns if self.store.has_peer(p.to_base58())]}
         if req["cmd"] == "stop":
             return {}
         pid = ID.from_base58(req["peer"])
@@ -870,6 +1060,7 @@ def start(store: Store, port: int, bootstrap: tuple[str, ...], detach: bool, no_
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("libp2p").setLevel(level if verbose > 1 else logging.CRITICAL)
     logging.getLogger("libp2p").propagate = verbose > 1  # libp2p silences itself unless LIBP2P_DEBUG is set
+    store.prune_peers()  # the daemon also prunes hourly as it meets peers (Store.remember_peer)
     while True:  # supervise: a crash inside libp2p restarts the node instead of killing the daemon
         node = Node(store, port, list(bootstrap), echo=True, mdns=not no_mdns, public=not private)
         try:
@@ -897,10 +1088,10 @@ def stop(store: Store) -> None:
 def status(store: Store) -> None:
     """Show own peer ID, addresses and connected peers."""
     r = daemon_call(store, cmd="status")
-    click.echo(f"peer id:      {r['id']}\nusername:     {store.config()['username'] or '-'}\n"
+    click.echo(f"peer id:      {r['id']}\nusername:     {store.username() or '-'}\n"
                f"reachability: {r['reachability']}\ndht:          {r['dht']}\nconnections:  {r['connections']}")
     for p in r["relays"]:
-        click.echo(f"relay:        {store.label(p) if p in store.peers() else p}")
+        click.echo(f"relay:        {store.label(p) if store.has_peer(p) else p}")
     for a in r["addrs"]:
         click.echo(f"addr:         {a}")
     for p, link in r["connected"]:
@@ -914,7 +1105,7 @@ def username(store: Store, name: str | None) -> None:
     """Show or set the username you present to peers you meet."""
     if name is not None:
         store.set_config(username=name)
-    click.echo(store.config()["username"] or "(no username set)")
+    click.echo(store.username() or "(no username set)")
 
 
 @cli.command()
@@ -923,12 +1114,8 @@ def username(store: Store, name: str | None) -> None:
 @click.pass_obj
 def nick(store: Store, peer: str, name: str | None) -> None:
     """Locally nickname PEER (overrides their own username). Omit NAME to remove the nickname."""
-    pid, nicks = store.resolve(peer), store.config()["nicks"]
-    if name:
-        nicks[pid] = name
-    else:
-        nicks.pop(pid, None)
-    store.set_config(nicks=nicks)
+    pid = store.resolve(peer)
+    store.set_nick(pid, name)
     click.echo(f"{pid} -> {name or '(nickname removed)'}")
 
 
@@ -939,7 +1126,7 @@ def nick(store: Store, peer: str, name: str | None) -> None:
 def send(store: Store, peer: str, message: tuple[str, ...]) -> None:
     """Send MESSAGE to PEER (found by ID via known peers, peer exchange and the DHT)."""
     pid = store.resolve(peer)
-    if pid in store.config()["blocked"]:
+    if store.is_blocked(pid):
         raise click.ClickException("that peer is blocked; unblock it first")
     daemon_call(store, cmd="send", peer=pid, text=" ".join(message))
     click.echo(f"sent to {store.label(pid)}")
@@ -953,17 +1140,15 @@ def send(store: Store, peer: str, message: tuple[str, ...]) -> None:
 def read(store: Store, peer: str | None, last: int, follow: bool) -> None:
     """Read messages, optionally only the conversation with PEER."""
     pid = store.resolve(peer) if peer else None
-    msgs = [m for m in store.messages() if pid in (None, m["peer"]) and m["peer"] not in store.config()["blocked"]]
-    for m in msgs[-last:] if last else msgs:
+    msgs = store.messages(peer=pid, last=last or None, include_blocked=False)
+    for m in msgs:
         click.echo(fmt_msg(store, m))
-    seen = len(store.messages())
-    while follow:
+    seen = msgs[-1]["id"] if msgs else 0  # no match yet means every later match is new
+    while follow:  # each poll is an indexed range scan over only the new rows
         time.sleep(1)
-        new = store.messages()[seen:]
-        seen += len(new)
-        for m in new:
-            if pid in (None, m["peer"]) and m["peer"] not in store.config()["blocked"]:
-                click.echo(fmt_msg(store, m))
+        for m in store.messages(peer=pid, after=seen, include_blocked=False):
+            seen = m["id"]
+            click.echo(fmt_msg(store, m))
 
 
 @cli.command()
@@ -1001,7 +1186,7 @@ def find(store: Store, peer: str) -> None:
 def block(store: Store, peer: str) -> None:
     """Block PEER: drop its messages and refuse its requests."""
     pid = store.resolve(peer)
-    store.set_config(blocked=sorted({*store.config()["blocked"], pid}))
+    store.block(pid)
     click.echo(f"blocked {pid}")
 
 
@@ -1011,7 +1196,7 @@ def block(store: Store, peer: str) -> None:
 def unblock(store: Store, peer: str) -> None:
     """Unblock PEER."""
     pid = store.resolve(peer)
-    store.set_config(blocked=[b for b in store.config()["blocked"] if b != pid])
+    store.unblock(pid)
     click.echo(f"unblocked {pid}")
 
 
