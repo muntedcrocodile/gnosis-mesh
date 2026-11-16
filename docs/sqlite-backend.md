@@ -4,7 +4,7 @@ Branch `experiment/sqlite-backend`. Status: a working prototype. Tests pass, and
 messages using it.
 
 **Recommendation: adopt with changes.** Replace `config.json`, `peers.json` and `messages.jsonl` with one
-`store.db` that uses the standard-library `sqlite3` module in WAL mode. Call it synchronously from the trio thread.
+`store.db` that uses the standard-library `sqlite3` module in WAL mode. Reads run inline; the daemon's writes go through `AsyncStore`.
 Keep `key` as its own file. The changes still needed before merging to `main` are listed at the end.
 
 ## 1. What is wrong today, measured
@@ -57,7 +57,7 @@ point lookup or range scan.
 * **Writes can block for seconds, so they go to a thread.** A write waits up to `busy_timeout` (5 s) whenever
   another process holds the write lock, for example the CLI running `block`, `nick` or a startup prune. Run inline,
   that wait freezes the daemon's whole event loop, networking included. `AsyncStore` runs `remember_peer`,
-  `log_message` and `prune_peers` in a worker thread instead. The hop costs about 90 µs per write (about 41 µs inline
+  `log_message` in a worker thread instead. The hop costs about 90 µs per write (about 41 µs inline
   versus about 129 µs threaded), which is negligible next to a network round trip.
   `tests/test_async.py` holds the lock from another process for 0.5 s and checks that the event loop never pauses
   for more than 0.25 s. It also checks that the same write done inline does stall for the whole lock.
@@ -69,15 +69,14 @@ point lookup or range scan.
   (tested).
 * **Reads stay inline.** In WAL mode readers never wait for writers, and a point read (`is_blocked`, `label`,
   `has_peer`) is far cheaper than a thread hop.
-* **One connection per thread.** A `sqlite3` connection must not be shared between threads. The Store opens a
-  connection lazily for each thread that uses it (`threading.local`). It closes connections whose threads have exited
-  (for example idle trio workers), and `close()` closes them all. SQLite's file locking then serialises threads
-  exactly as it serialises the CLI and the daemon. The Store is safe to call from any thread, not just through
-  `AsyncStore`.
+* **Two connections in the daemon.** The trio thread reads through the daemon's `Store`. `AsyncStore` opens its own
+  `Store`, which only one worker thread uses at a time (enforced by the limiter), so no connection is ever shared
+  between threads at once. SQLite's file locking serialises the two connections exactly as it does the CLI and the
+  daemon.
 * **One rule still matters: never hold a transaction across an `await`.** Every Store method is self-contained:
   each `_tx()` opens and commits within one synchronous call on one thread.
 * **When to reconsider.** If the daemon starts running heavy queries, such as full-text search over a large
-  history or bulk exports, run them through `AsyncStore.run(...)` too. Any thread gets its own connection.
+  history or bulk exports, run them through `AsyncStore.run(...)` too.
 
 ## 3. WAL mode and CLI + daemon concurrency
 

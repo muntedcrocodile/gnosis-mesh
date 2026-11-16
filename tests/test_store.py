@@ -171,7 +171,7 @@ def test_db_is_private_and_in_wal_mode(store: Store, home: Path) -> None:
 
 def test_node_remember_and_blocked_use_store(store: Store) -> None:
     pid = ID.from_base58(new_pid())
-    fake = SimpleNamespace(store=store, astore=AsyncStore(store), addrs=lambda _: [Multiaddr("/ip4/1.2.3.4/tcp/4777")])
+    fake = SimpleNamespace(store=store, astore=AsyncStore(store.home), addrs=lambda _: [Multiaddr("/ip4/1.2.3.4/tcp/4777")])
     trio.run(Node.remember, fake, pid, "alice")  # type: ignore[arg-type]
     fake.addrs = lambda _: []
     trio.run(Node.remember, fake, pid, None)  # type: ignore[arg-type]

@@ -1,16 +1,12 @@
-"""The Store under asynchronous use: many trio tasks, worker threads, a write lock held by another process,
-and cancellation."""
+"""AsyncStore under trio: many concurrent tasks, a write lock held by another process, and cancellation."""
 from __future__ import annotations
 
-import sqlite3
 import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import pytest
 import trio
 
 from gnosis_mesh import AsyncStore, Store
@@ -44,25 +40,8 @@ class LockHolder:
         assert self.proc.wait(timeout=10) == 0
 
 
-def test_store_is_usable_from_many_threads(store: Store) -> None:
-    def work(t: int) -> None:
-        for i in range(100):
-            store.remember_peer(f"t{t}-{i}", [f"/ip4/10.0.{t}.{i}/tcp/1"], f"name{t}")
-            store.remember_peer("shared", [], f"t{t}")  # same row from every thread
-            store.log_message(f"t{t}-{i}", "in", f"{t}:{i}")
-            assert store.has_peer(f"t{t}-{i}")
-            if i % 25 == 0:
-                store.set_config(username=f"u{t}")  # a _tx() per thread, on that thread's own connection
-
-    with ThreadPoolExecutor(8) as pool:
-        list(pool.map(work, range(8)))
-    assert len(store.peers()) == 8 * 100 + 1
-    assert len(store.messages()) == 8 * 100
-    assert len(store._conns) >= 2  # the worker threads really did get their own connections
-
-
 def test_concurrent_trio_tasks_lose_nothing_and_keep_order(store: Store) -> None:
-    astore = AsyncStore(store)
+    astore = AsyncStore(store.home)
 
     async def main() -> None:
         async with trio.open_nursery() as n:
@@ -83,7 +62,7 @@ def test_concurrent_trio_tasks_lose_nothing_and_keep_order(store: Store) -> None
 
 
 def test_waiting_on_another_process_does_not_block_the_event_loop(store: Store, home: Path) -> None:
-    astore = AsyncStore(store)
+    astore = AsyncStore(store.home)
     holder = LockHolder(home)
     gaps: list[float] = []
 
@@ -126,7 +105,7 @@ def test_sync_write_would_have_stalled(home: Path) -> None:
 
 
 def test_cancelled_write_still_completes_exactly_once(store: Store, home: Path) -> None:
-    astore = AsyncStore(store)
+    astore = AsyncStore(store.home)
     holder = LockHolder(home)
 
     async def main() -> None:
@@ -140,31 +119,6 @@ def test_cancelled_write_still_completes_exactly_once(store: Store, home: Path) 
 
     trio.run(main)
     assert [m["text"] for m in store.messages()] == ["cancelled mid-wait"]
-    assert store.db.in_transaction is False  # nothing left open on this thread's connection
+    assert astore.store.db.in_transaction is False  # nothing left open on the writer connection
     store.log_message("p", "in", "after")  # and the store still works
     assert len(store.messages()) == 2
-
-
-def test_close_closes_every_threads_connection(home: Path) -> None:
-    store = Store(home)
-    conns: list[sqlite3.Connection] = []
-    t = threading.Thread(target=lambda: conns.append(store.db))
-    t.start()
-    t.join()
-    main_conn = store.db
-    store.close()
-    for conn in [*conns, main_conn]:
-        with pytest.raises(sqlite3.ProgrammingError):
-            conn.execute("SELECT 1")
-    assert store.has_peer("x") is False  # reopening after close works
-
-
-def test_connections_of_exited_threads_are_closed(home: Path) -> None:
-    store = Store(home)
-    for _ in range(5):
-        t = threading.Thread(target=lambda: store.db)
-        t.start()
-        t.join()
-    store.db  # opening another connection sweeps the dead threads' ones
-    assert len(store._conns) <= 2
-    store.close()

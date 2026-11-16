@@ -40,7 +40,7 @@ def test_peer_exchange_reply_is_capped(store: Store) -> None:
     async def new_stream(*_: Any) -> FakeStream:
         return stream
 
-    fake = SimpleNamespace(store=store, astore=AsyncStore(store), addrs=lambda _: [],
+    fake = SimpleNamespace(store=store, astore=AsyncStore(store.home), addrs=lambda _: [],
                            host=SimpleNamespace(new_stream=new_stream),
                            learn=lambda pid, addrs: learned.__setitem__(pid.to_base58(), addrs))
     fake.remember = lambda pid, name: Node.remember(fake, pid, name)  # type: ignore[arg-type]

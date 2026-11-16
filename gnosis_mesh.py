@@ -29,7 +29,6 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
@@ -130,43 +129,18 @@ class Store:
         self.db_path = home / "store.db"
         if not self.db_path.exists():  # messages are private: create the db (SQLite copies its mode to -wal/-shm) 0600
             os.close(os.open(self.db_path, os.O_WRONLY | os.O_CREAT, 0o600))
-        # One connection per thread, so the Store can be used from any thread (trio.to_thread workers, callbacks):
-        # a sqlite3 connection must not be shared between threads, and a shared one would let two threads'
-        # transactions interleave. SQLite's own locking then serialises them exactly as it does the CLI and daemon.
-        self._local = threading.local()
-        self._conns: list[tuple[threading.Thread, sqlite3.Connection]] = []
-        self._conns_lock = threading.Lock()
+        # Autocommit; writes that must be atomic use _tx(). WAL lets readers proceed while one writer commits;
+        # busy_timeout covers the brief writer-vs-writer overlap. Not tied to the creating thread so AsyncStore can
+        # use its own Store from worker threads, but only one thread may use a Store at a time.
+        self.db = sqlite3.connect(self.db_path, isolation_level=None, timeout=5, check_same_thread=False)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=NORMAL")  # durable across app crashes; an OS crash may lose the last commit
         self._last_prune = time.time()
         self._migrate()
 
-    @property
-    def db(self) -> sqlite3.Connection:
-        """This thread's connection, opened on first use."""
-        conn: sqlite3.Connection | None = getattr(self._local, "db", None)
-        if conn is None:
-            # Autocommit; writes that must be atomic use _tx(). WAL lets readers proceed while one writer commits;
-            # busy_timeout covers the brief writer-vs-writer overlap. check_same_thread=False only so close() can
-            # close other threads' connections: each connection is still used by its own thread alone.
-            conn = sqlite3.connect(self.db_path, isolation_level=None, timeout=5, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")  # durable across app crashes; an OS crash may lose the last commit
-            self._local.db = conn
-            with self._conns_lock:  # close connections of threads that have exited (e.g. idle trio workers)
-                for thread, old in self._conns:
-                    if not thread.is_alive():
-                        old.close()
-                self._conns = [(t, c) for t, c in self._conns if t.is_alive()]
-                self._conns.append((threading.current_thread(), conn))
-        return conn
-
     def close(self) -> None:
-        """Close every thread's connection. Call it once no other thread is using the Store."""
-        with self._conns_lock:
-            for _, conn in self._conns:
-                conn.close()
-            self._conns = []
-        self._local = threading.local()
+        self.db.close()
 
     @contextlib.contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -369,31 +343,23 @@ class Store:
 
 
 class AsyncStore:
-    """Awaitable writes for trio code. A write can wait up to busy_timeout (5 s) for another process's write lock
-    (the CLI running `block` or `nick`, say); run inline, that wait would freeze the whole event loop, so these run
-    in a worker thread instead. One write at a time, in the order they were awaited (trio's limiter is FIFO), so
-    messages are stored in the order they were logged. If the awaiting task is cancelled, the write still finishes
-    before the cancellation is delivered, so it is never left half-done.
+    """Awaitable writes for trio code, on a connection of their own. A write can wait up to busy_timeout (5 s) for
+    another process's write lock (the CLI running `block`, say); inline, that would freeze the event loop, so writes
+    run in a worker thread, one at a time and in the order awaited (trio's limiter is FIFO). A cancelled caller
+    still lets its write finish, so none is left half-done. Reads stay synchronous on the caller's Store: in WAL
+    mode readers never wait for writers."""
 
-    Reads stay synchronous on the Store: in WAL mode readers never wait for writers, and a thread hop costs more
-    than a point read. Don't hold a Store transaction across an `await`; every Store method is self-contained."""
-
-    def __init__(self, store: Store) -> None:
-        self.store = store
-        self._writer = trio.CapacityLimiter(1)
+    def __init__(self, home: Path) -> None:
+        self.store, self._writer = Store(home), trio.CapacityLimiter(1)
 
     async def run(self, fn: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
-        """Run any Store method (or other blocking call) in the writer thread."""
         return await trio.to_thread.run_sync(functools.partial(fn, *args, **kwargs), limiter=self._writer)
 
-    async def remember_peer(self, pid: str, addrs: list[str], name: str | None, seen: float | None = None) -> None:
-        await self.run(self.store.remember_peer, pid, addrs, name, seen)
+    async def remember_peer(self, pid: str, addrs: list[str], name: str | None) -> None:
+        await self.run(self.store.remember_peer, pid, addrs, name)
 
     async def log_message(self, peer: str, direction: str, text: str) -> None:
         await self.run(self.store.log_message, peer, direction, text)
-
-    async def prune_peers(self, ttl: float | None = None, keep: int | None = None) -> int:
-        return await self.run(self.store.prune_peers, ttl, keep)
 
 
 # ---------- libp2p daemon ----------
@@ -456,7 +422,7 @@ MESH_KEY = "1220" + hashlib.sha256(b"gnosis-mesh:/mesh/1").hexdigest()
 class Node:
     def __init__(self, store: Store, port: int, bootstrap: list[str], echo: bool, mdns: bool, public: bool) -> None:
         self.store, self.bootstrap, self.echo, self.public = store, bootstrap, echo, public
-        self.astore = AsyncStore(store)  # daemon writes go through here so a busy db never blocks the event loop
+        self.astore = AsyncStore(store.home)  # daemon writes go through here so a busy db never blocks the event loop
         fams = ["/ip4/0.0.0.0"] + (["/ip6/::"] if is_ipv6_available() else [])
         self.listen = [Multiaddr(f"{f}/{t}") for f in fams for t in (f"tcp/{port}", f"udp/{port}/quic-v1")]
         self.keys = create_new_key_pair(store.key_seed())
@@ -1024,6 +990,7 @@ class Node:
         try:
             await self.serve()
         finally:
+            self.astore.store.close()
             with trio.CancelScope(shield=True):
                 await self.shutdown()
 
