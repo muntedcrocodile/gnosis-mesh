@@ -72,7 +72,7 @@ def test_peers_keeps_first_met_order_and_recent_peers_is_newest_first(store: Sto
     assert list(store.peers()) == ["a", "b", "c"]
     assert list(store.recent_peers(2)) == ["c", "b"]
     store.block("c")
-    assert list(store.recent_peers(2, exclude_blocked=True)) == ["b", "a"]
+    assert list(store.recent_peers(2)) == ["b", "a"]  # blocked peers are never re-dialled or shared
     assert store.has_peer("a") and not store.has_peer("zz")
 
 

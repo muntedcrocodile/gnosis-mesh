@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import collections
 import contextlib
-import functools
 import hashlib
 import ipaddress
 import json
@@ -33,7 +32,7 @@ import tempfile
 import time
 from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
-from typing import Any, ParamSpec, TypeVar
+from typing import Any, TypeVar
 
 import click
 import multihash
@@ -102,7 +101,6 @@ CREATE INDEX messages_peer ON messages (peer, id);
 """
 SCHEMA_VERSION = 1
 LEGACY_FILES = ("config.json", "peers.json", "messages.jsonl")
-P = ParamSpec("P")
 T = TypeVar("T")
 
 
@@ -256,10 +254,10 @@ class Store:
         """Every remembered peer, {pid: {name?, addrs, seen}}, in the order first met (prefer recent_peers)."""
         return {r["pid"]: self._peer(r) for r in self.db.execute("SELECT * FROM peers ORDER BY rowid")}
 
-    def recent_peers(self, limit: int, exclude_blocked: bool = False) -> Json:
-        """The `limit` most recently seen peers, newest first."""
-        where = "WHERE pid NOT IN (SELECT pid FROM blocked)" if exclude_blocked else ""
-        rows = self.db.execute(f"SELECT * FROM peers {where} ORDER BY seen DESC LIMIT ?", (limit,))
+    def recent_peers(self, limit: int) -> Json:
+        """The `limit` most recently seen unblocked peers, newest first."""
+        rows = self.db.execute("SELECT * FROM peers WHERE pid NOT IN (SELECT pid FROM blocked) ORDER BY seen DESC "
+                               "LIMIT ?", (limit,))
         return {r["pid"]: self._peer(r) for r in rows}
 
     def has_peer(self, pid: str) -> bool:
@@ -355,8 +353,8 @@ class AsyncStore:
     def __init__(self, home: Path) -> None:
         self.store, self._writer = Store(home), trio.CapacityLimiter(1)
 
-    async def run(self, fn: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
-        return await trio.to_thread.run_sync(functools.partial(fn, *args, **kwargs), limiter=self._writer)
+    async def run(self, fn: Callable[..., T], *args: Any) -> T:
+        return await trio.to_thread.run_sync(fn, *args, limiter=self._writer)
 
     async def remember_peer(self, pid: str, addrs: list[str], name: str | None) -> None:
         await self.run(self.store.remember_peer, pid, addrs, name)
@@ -552,7 +550,7 @@ class Node:
                     if self.echo:
                         click.echo(f"\n[{self.store.label(pid.to_base58())}] {req['text']}")
             elif req["t"] == "peers":
-                reply["peers"] = [{"id": k, **v} for k, v in self.store.recent_peers(PEX_LIMIT, exclude_blocked=True).items()
+                reply["peers"] = [{"id": k, **v} for k, v in self.store.recent_peers(PEX_LIMIT).items()
                                   if k != pid.to_base58()]
             await stream.write(json.dumps(reply).encode())
             await stream.close()
@@ -711,14 +709,11 @@ class Node:
             return False
         with trio.move_on_after(120):
             closest = await self.dht.peer_routing.find_closest_peers_network(self.host.get_id().to_bytes())
-            stored: dict[str, bool] = {}
             async with trio.open_nursery() as n:
-                async def provide(name: str, key: str) -> None:
-                    stored[name] = bool(await self.dht.provide(key))
-                n.start_soon(provide, "own", rendezvous_key(self.me))
-                n.start_soon(provide, "mesh", MESH_KEY)
-            log.info("announced: %d closest peers, provider records stored=%s", len(closest), stored)
-            return stored["own"]
+                n.start_soon(self.dht.provide, MESH_KEY)  # so nodes that know no chat peer yet can find us
+                provided = bool(await self.dht.provide(rendezvous_key(self.me)))
+            log.info("announced: %d closest peers, provider record stored=%s", len(closest), provided)
+            return provided
         log.info("announce timed out")
         return False
 
@@ -742,21 +737,6 @@ class Node:
         found.pop(self.host.get_id(), None)
         return list(found.values())
 
-    async def exchange(self, pid: ID) -> list[ID]:
-        """Peer exchange: the chat peers pid has met (request() also stores their addresses)."""
-        try:
-            reply = await self.request(pid, "peers")
-        except Exception as e:
-            log.debug("peer exchange with %s failed: %s", pid, e)
-            return []
-        out = []
-        for p in reply.get("peers", []):
-            try:
-                out.append(ID.from_base58(p["id"]))
-            except Exception:
-                pass
-        return out
-
     async def discover(self) -> bool:
         """While connected to fewer than MESH_TARGET chat peers: collect candidates from the mesh's provider
         records and from peer exchange with the chat peers we have, then dial a random batch of them."""
@@ -768,18 +748,15 @@ class Node:
         candidates: set[ID] = set()
         async with trio.open_nursery() as n:
             async def from_dht() -> None:
-                with trio.move_on_after(60):
-                    try:
-                        for info in await self.find_mesh_peers():
-                            self.learn(info.peer_id, [str(a) for a in info.addrs])
-                            candidates.add(info.peer_id)
-                    except Exception as e:
-                        log.debug("mesh lookup failed: %s", e)
+                with trio.move_on_after(60), contextlib.suppress(Exception):
+                    for info in await self.find_mesh_peers():
+                        self.learn(info.peer_id, [str(a) for a in info.addrs])
+                        candidates.add(info.peer_id)
 
-            async def from_peer(pid: ID) -> None:
-                candidates.update(await self.exchange(pid))
-            if self.dht.get_routing_table_size():
-                n.start_soon(from_dht)
+            async def from_peer(pid: ID) -> None:  # peer exchange (request() also learns their addresses)
+                with contextlib.suppress(Exception):
+                    candidates.update(ID.from_base58(p["id"]) for p in (await self.request(pid, "peers"))["peers"])
+            n.start_soon(from_dht)
             for pid in have:
                 n.start_soon(from_peer, pid)
         fresh = [p for p in candidates if p != self.host.get_id() and p not in have and not self.connected(p)
@@ -911,7 +888,7 @@ class Node:
                     continue  # e.g. /dnsaddr: resolved by libp2p's bootstrap discovery instead
                 self.learn(info.peer_id, [str(a) for a in info.addrs])
                 n.start_soon(self.try_connect, info.peer_id)
-            for known, p in self.store.recent_peers(DIAL_ON_START, exclude_blocked=True).items():
+            for known, p in self.store.recent_peers(DIAL_ON_START).items():
                 self.learn(ID.from_base58(known), p.get("addrs", []))
                 n.start_soon(self.try_connect, ID.from_base58(known))
             n.start_soon(self.maintain)
