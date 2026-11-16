@@ -88,32 +88,19 @@ log = logging.getLogger("gnosis-mesh")
 # ---------- local storage: store.db (SQLite, WAL) shared by the CLI and the daemon; the identity seed stays in `key` ----------
 
 SCHEMA = """
-CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;  -- JSON values, e.g. username
-CREATE TABLE nicks (pid TEXT PRIMARY KEY, nick TEXT NOT NULL) WITHOUT ROWID;
-CREATE INDEX nicks_nick ON nicks (nick);
-CREATE TABLE blocked (pid TEXT PRIMARY KEY) WITHOUT ROWID;
-CREATE TABLE peers (pid TEXT NOT NULL UNIQUE, name TEXT, addrs TEXT NOT NULL DEFAULT '[]', seen REAL NOT NULL);
-CREATE INDEX peers_seen ON peers (seen);
-CREATE INDEX peers_name ON peers (name);
-CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, peer TEXT NOT NULL,
-                       dir TEXT NOT NULL CHECK (dir IN ('in', 'out')), text TEXT NOT NULL);
-CREATE INDEX messages_peer ON messages (peer, id);
+-- settings values are JSON, e.g. username
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS nicks (pid TEXT PRIMARY KEY, nick TEXT NOT NULL) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS nicks_nick ON nicks (nick);
+CREATE TABLE IF NOT EXISTS blocked (pid TEXT PRIMARY KEY) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS peers (pid TEXT NOT NULL UNIQUE, name TEXT, addrs TEXT NOT NULL DEFAULT '[]', seen REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS peers_seen ON peers (seen);
+CREATE INDEX IF NOT EXISTS peers_name ON peers (name);
+CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, peer TEXT NOT NULL,
+                                     dir TEXT NOT NULL CHECK (dir IN ('in', 'out')), text TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS messages_peer ON messages (peer, id);
 """
-SCHEMA_VERSION = 1
-LEGACY_FILES = ("config.json", "peers.json", "messages.jsonl")
 T = TypeVar("T")
-
-
-def socket_path(home: Path) -> str:
-    """The daemon's control socket for a data dir.
-    AF_UNIX socket paths are limited to 108 bytes on Linux and 104 on macOS: use the first runtime dir whose
-    socket path fits (/tmp always does), so a long $XDG_RUNTIME_DIR or $TMPDIR can't stop the node starting."""
-    name = f"gnosis-mesh-{hashlib.sha1(str(home.resolve()).encode()).hexdigest()[:12]}.sock"
-    for run_dir in (os.environ.get("XDG_RUNTIME_DIR"), tempfile.gettempdir(), "/tmp"):
-        path = os.path.join(run_dir or "/tmp", name)
-        if len(path.encode()) < 104:
-            return path
-    return path
 
 
 class Store:
@@ -124,7 +111,13 @@ class Store:
     def __init__(self, home: Path) -> None:
         self.home = home
         home.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.sock = socket_path(home)
+        # AF_UNIX socket paths are limited to 108 bytes on Linux and 104 on macOS: use the first runtime dir whose
+        # socket path fits (/tmp always does), so a long $XDG_RUNTIME_DIR or $TMPDIR can't stop the node starting.
+        name = f"gnosis-mesh-{hashlib.sha1(str(home.resolve()).encode()).hexdigest()[:12]}.sock"
+        for run_dir in (os.environ.get("XDG_RUNTIME_DIR"), tempfile.gettempdir(), "/tmp"):
+            self.sock = os.path.join(run_dir or "/tmp", name)
+            if len(self.sock.encode()) < 104:
+                break
         self.db_path = home / "store.db"
         if not self.db_path.exists():  # messages are private: create the db (SQLite copies its mode to -wal/-shm) 0600
             os.close(os.open(self.db_path, os.O_WRONLY | os.O_CREAT, 0o600))
@@ -136,7 +129,7 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")  # durable across app crashes; an OS crash may lose the last commit
         self._last_prune = time.time()
-        self._migrate()
+        self.db.executescript(SCHEMA)
 
     def close(self) -> None:
         self.db.close()
@@ -151,65 +144,6 @@ class Store:
             self.db.execute("ROLLBACK")
             raise
         self.db.execute("COMMIT")
-
-    # --- schema + one-time import of the JSON files used before store.db ---
-    def _migrate(self) -> None:
-        if self.db.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
-            return
-        if any((self.home / name).exists() for name in LEGACY_FILES) and self._daemon_listening():
-            # an older daemon would keep writing the JSON files after we import them, and those writes would be lost
-            raise click.ClickException("a gnosis-mesh daemon from before store.db is running for this --home; "
-                                       "stop it (`gnosis_mesh.py stop` with the old version), then retry")
-        imported: list[str] = []
-        with self._tx() as db:  # the write lock serialises concurrent first runs: only one of them imports
-            if db.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
-                return
-            for stmt in filter(str.strip, SCHEMA.split(";")):  # not executescript: it would COMMIT our transaction
-                db.execute(stmt)
-            imported = self._import_legacy(db)
-            db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-        for name in imported:  # only once the import is committed; the originals are kept as a backup
-            (self.home / name).replace(self.home / f"{name}.migrated")
-        if imported:
-            log.info("migrated %s into %s", ", ".join(imported), self.db_path)
-
-    def _daemon_listening(self) -> bool:
-        with socket.socket(socket.AF_UNIX) as sock:
-            sock.settimeout(1)
-            try:
-                sock.connect(self.sock)
-                return True
-            except OSError:  # no socket file, or a stale one nobody listens on
-                return False
-
-    def _import_legacy(self, db: sqlite3.Connection) -> list[str]:
-        imported: list[str] = []
-        if (p := self.home / "config.json").exists():
-            cfg = json.loads(p.read_text() or "{}")
-            db.executemany("INSERT OR REPLACE INTO nicks VALUES (?, ?)", (cfg.pop("nicks", None) or {}).items())
-            db.executemany("INSERT OR IGNORE INTO blocked VALUES (?)", ((b,) for b in cfg.pop("blocked", None) or []))
-            db.executemany("INSERT OR REPLACE INTO settings VALUES (?, ?)", ((k, json.dumps(v)) for k, v in cfg.items()))
-            imported.append(p.name)
-        if (p := self.home / "peers.json").exists():
-            peers = json.loads(p.read_text() or "{}")
-            db.executemany("INSERT OR REPLACE INTO peers (pid, name, addrs, seen) VALUES (?, ?, ?, ?)",
-                           ((pid, e.get("name"), json.dumps(e.get("addrs", [])), float(e.get("seen", 0)))
-                            for pid, e in peers.items()))
-            imported.append(p.name)
-        if (p := self.home / "messages.jsonl").exists():
-            rows, bad = [], 0
-            with open(p) as f:
-                for line in f:
-                    try:
-                        m = json.loads(line)
-                        rows.append((float(m["ts"]), m["peer"], m["dir"], m["text"]))
-                    except (ValueError, KeyError, TypeError):  # e.g. a line truncated by a crash mid-append
-                        bad += line.strip() != ""
-            db.executemany("INSERT INTO messages (ts, peer, dir, text) VALUES (?, ?, ?, ?)", rows)
-            if bad:
-                log.warning("skipped %d unreadable lines in %s", bad, p)
-            imported.append(p.name)
-        return imported
 
     # --- config: username, nicknames, block list ---
     def config(self) -> Json:

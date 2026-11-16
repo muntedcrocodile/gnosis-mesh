@@ -247,10 +247,7 @@ The default is `~/.gnosis-mesh` on port 4777. The port is used for TCP and for U
 | `store.db` | SQLite database (mode 600, WAL mode, so `store.db-wal` and `store.db-shm` sit next to it) shared safely by the CLI and the daemon. It holds your username, nicknames and block list, the chat peers you've met (their usernames, last known addresses and when you last saw them), and your message history. Peers you haven't seen for 30 days are forgotten, and at most 2000 are kept. Peers you've nicknamed or exchanged messages with are always kept. |
 | `daemon.log` | Output from the background node. |
 
-Older versions kept this data in `config.json`, `peers.json` and `messages.jsonl`. The first run of a newer version
-imports them into `store.db` and renames them to `*.migrated`, which you can delete once you're happy. If an
-older daemon is still running, the import refuses to start until you stop it. To inspect the
-data by hand, use `sqlite3 ~/.gnosis-mesh/store.db`.
+To inspect the data by hand, use `sqlite3 ~/.gnosis-mesh/store.db`.
 
 The CLI talks to the daemon through a Unix socket named after the data directory. It lives in `$XDG_RUNTIME_DIR`,
 or the system temp directory if that isn't set. If the resulting path would be too long for a Unix socket (about

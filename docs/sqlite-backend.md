@@ -22,7 +22,6 @@ the numbers are reproduced here.
 | `read -n 20` | 187 ms | 0.03 ms |
 | One `read -f` poll with nothing new (runs every second) | 187 ms | 0.004 ms |
 | Peer list for startup dialing (all of them vs the 64 most recent) | 2.3 ms | 0.15 ms |
-| One-time migration of the whole data set | – | 370 ms |
 | Size on disk | 15.6 MB | 13.4 MB |
 
 The JSON costs grow linearly: `remember` rewrites all of `peers.json` on every protocol request, and `read`
@@ -114,7 +113,6 @@ blocked  (pid TEXT PRIMARY KEY)
 peers    (pid TEXT UNIQUE, name TEXT, addrs TEXT, seen REAL)   -- indexes on seen and name
 messages (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, peer TEXT,
           dir TEXT CHECK (dir IN ('in','out')), text TEXT)     -- index on (peer, id)
-PRAGMA user_version = 1                                -- schema version, for future migrations
 ```
 
 * `nicks` and `blocked` are tables instead of JSON lists. That makes `is_blocked()` an indexed lookup, makes
@@ -146,9 +144,6 @@ New methods were added for the hot paths:
 
 ### Call-site changes outside `Store`
 
-A small refactor moved the socket-path calculation out of `Store.__init__` into `socket_path(home)`, so the
-migration guard and the tests can use it. `store.sock` is unchanged.
-
 The changes are deliberately small. None of them touch the mesh-discovery code (`discover`, `find_mesh_peers`,
 `exchange`).
 
@@ -171,36 +166,11 @@ so a long-running daemon stays bounded without changes to `Node`'s maintenance l
 only the 64 most recently seen peers; the rest are still known and can be found through `find`. All four limits are
 class or module constants and should be tuned against real peer counts from mesh discovery.
 
-## 6. Migrating the JSON files on first run
+## 6. No migration from the JSON files
 
-`Store.__init__` checks `PRAGMA user_version`. If the schema is older than the code expects, it does the following
-in **one `BEGIN IMMEDIATE` transaction**:
-
-1. Create the schema.
-2. Import `config.json`. `nicks` and `blocked` go into their tables; every other key goes into `settings`, so
-   unknown keys survive.
-3. Import `peers.json`.
-4. Import `messages.jsonl` in file order. A truncated or garbled line, such as a partial last line from a crash
-   mid-append, is skipped with a warning.
-5. Set `user_version`.
-
-Only **after the commit** are the files renamed to `*.migrated`. They are kept as a backup and never deleted.
-
-Properties covered by the tests in `tests/test_migration.py`:
-
-* **Atomic.** A corrupt `peers.json` makes the import raise. Nothing is half-imported, the original files stay
-  untouched, and the next run retries after the file is fixed.
-* **Exactly once, even when racing.** The CLI and the daemon starting at the same moment are serialised by the
-  write lock, and the loser sees the new `user_version` and skips the import. The test starts four processes at
-  once.
-* **Never re-imported.** If something recreates `messages.jsonl` after the migration, the file is ignored and not
-  imported a second time.
-* **Refuses while an old daemon is running.** An old daemon would keep writing the JSON files after the import,
-  and those writes would be lost. So if legacy files exist and the control socket accepts a connection, `Store()`
-  raises "stop it, then retry" and leaves everything untouched. A stale socket file that nothing listens on doesn't
-  block the migration.
-* **No downgrade path.** An older version would start with empty JSON files. Renaming the `*.migrated` files back
-  restores the pre-upgrade state, but not anything added since.
+Existing `config.json`, `peers.json` and `messages.jsonl` files are not imported: a node starts with an empty
+`store.db`, and the old files are simply ignored. Every table is created with `CREATE … IF NOT EXISTS`, so several
+processes starting at once are harmless. If the schema ever needs to change, add a version check then.
 
 ## 7. What stays a file
 
@@ -225,7 +195,7 @@ Properties covered by the tests in `tests/test_migration.py`:
 3. The cost is low. It uses only the standard library, with no new dependency (`requirements.txt` is unchanged).
    Async use needs only a small `AsyncStore` wrapper around `trio.to_thread`. The `Store` interface is mostly
    preserved, and the `Node` changes are a handful of small call-site edits.
-4. You can still inspect the data with `sqlite3 store.db`, and the schema is versioned for future changes.
+4. You can still inspect the data with `sqlite3 store.db`.
 
 **Changes to make before merging to `main`:**
 
@@ -233,8 +203,6 @@ Properties covered by the tests in `tests/test_migration.py`:
    discovery, which decides how many peers a node actually meets. (The branch is already rebased onto it.)
 2. **Regenerate `scripture.py`** with `make_scripture.py` when merging, if it is meant to track `gnosis_mesh.py`.
    The experiment branch leaves it alone.
-3. Optional: add a `gnosis_mesh.py export` command that writes the old JSON or JSONL files, for anyone who wants
-   plain-text history or a downgrade path.
 
 **Why not "don't adopt":** the main alternative is to patch the JSON store. That means unique temporary names plus
 `fcntl` locks, a separate pruned peers file, and an offset index for `messages.jsonl`. It would rebuild a weaker
@@ -242,14 +210,11 @@ database by hand and still rewrite the whole peers file on every request.
 
 ## Tests
 
-`.venv/bin/python -m pytest` runs 37 tests in about 5 seconds:
+`.venv/bin/python -m pytest` runs 29 tests in about 5 seconds:
 
 * `tests/test_store.py`: round-trips for config, nicknames, blocks, peers (`UPSERT` semantics and ordering),
   pruning (age, cap, exemptions, hourly trigger), messages (filters, `last`, `after`, blocked), `label`/`resolve`,
   file modes, WAL mode, and `Node.remember`/`Node.blocked` called with a stand-in host.
-* `tests/test_migration.py`: a full import that matches the source data exactly, running only once, partial and
-  empty files, a truncated last line, corrupt JSON leaving the files untouched, four processes migrating at once,
-  and refusing while a legacy daemon's socket is live (but not for a stale socket file).
 * `tests/test_concurrency.py`: two processes writing peers (including the same rows), messages, blocks and
   nicknames at once with no lost updates, and a `read -f` style cursor seeing every message from another process
   exactly once.
@@ -259,8 +224,6 @@ database by hand and still rewrite the whole peers file on every request.
 * `tests/test_node.py`: `Node` logic with stand-ins for the host and streams. It covers peer-exchange intake caps,
   `announce_loop` surviving errors, retried messages stored once, failed requests resetting their stream, blocked
   peers losing relay reservations, and malformed control requests.
-* `tests/test_cli.py`: `username`/`nick`/`block`/`unblock`/`blocked`/`read`/`peers` against a temporary `--home`,
-  plus the CLI migrating a legacy home.
+* `tests/test_cli.py`: `username`/`nick`/`block`/`unblock`/`blocked`/`read`/`peers` against a temporary `--home`.
 
-A manual end-to-end check passed too: two `--private --no-mdns` daemons on temporary homes, one of them migrated
-from legacy files, ran `send`, `read`, `read -f`, `peers` and `status` successfully.
+A manual end-to-end check passed too: two `--private --no-mdns` daemons on temporary homes ran `send`, `read`, `read -f`, `peers` and `status` successfully.

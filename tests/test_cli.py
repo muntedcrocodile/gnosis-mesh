@@ -1,7 +1,6 @@
 """CLI commands that only touch the store (no daemon), run against a temporary --home."""
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -46,12 +45,3 @@ def test_read_and_peers(home: Path) -> None:
     out = run(home, "peers")
     assert f"{a}  username=alice" in out and "[blocked]" in out
     assert b not in run(home, "peers", "--named")
-
-
-def test_cli_migrates_legacy_home(home: Path) -> None:
-    pid = new_pid()
-    home.mkdir()
-    (home / "config.json").write_text(json.dumps({"username": "old", "nicks": {pid: "pal"}, "blocked": []}))
-    (home / "messages.jsonl").write_text(json.dumps({"ts": 1.0, "peer": pid, "dir": "in", "text": "legacy"}) + "\n")
-    assert run(home, "username").strip() == "old"
-    assert "[pal] legacy" in run(home, "read")
