@@ -14,7 +14,7 @@ from libp2p.peer.peerstore import PeerStore
 from libp2p.relay.circuit_v2.pb.circuit_pb2 import HopMessage, PeerId
 
 from conftest import new_pid
-from gnosis_mesh import MAX_ADDRS, MESH_KEY, PEX_LIMIT, AsyncStore, Node, Store
+from gnosis_mesh import MAX_ADDRS, MAX_TEXT, MESH_KEY, PEX_LIMIT, AsyncStore, Node, Store
 
 
 class FakeStream:
@@ -63,18 +63,23 @@ def node_with(store: Store, reply: FakeStream | None = None) -> Any:
 
 # --- peer exchange ---
 
-def test_peer_exchange_is_capped_per_reply_and_in_total(store: Store) -> None:
-    """A peer can't make us keep an unbounded peer list, nor unbounded addresses for one peer across many replies."""
-    victims = [pid() for _ in range(PEX_LIMIT + 20)]
-    fake = node_with(store)
-    for round_ in range(3):  # fresh addresses for the same peers every time
-        peers = [{"id": v.to_base58(), "addrs": [f"/ip4/10.{round_}.0.1/tcp/{i}" for i in range(MAX_ADDRS + 50)]}
-                 for v in victims]
-        fake.reply = FakeStream({"name": "bob", "peers": peers})
-        reply = trio.run(Node.request, fake, pid(), "peers")
-        assert len(reply["peers"]) == PEX_LIMIT
-    assert all(len(fake.addrs(v)) == MAX_ADDRS for v in victims[:PEX_LIMIT])
-    assert all(fake.addrs(v) == [] for v in victims[PEX_LIMIT:])
+def test_peer_exchange_reply_is_capped_and_not_learned(store: Store) -> None:
+    """A reply can name any IDs: we keep at most PEX_LIMIT and add none to the peerstore (it holds only 1000)."""
+    named = [{"id": pid().to_base58(), "addrs": ["/ip4/10.0.0.1/tcp/1"]} for _ in range(PEX_LIMIT + 20)]
+    fake = node_with(store, FakeStream({"name": "bob", "peers": named}))
+    reply = trio.run(Node.request, fake, pid(), "peers")
+    assert reply["peers"] == named[:PEX_LIMIT]
+    assert fake.host.get_peerstore().peer_ids() == []
+
+
+def test_learn_keeps_the_newest_addresses(store: Store) -> None:
+    fake, peer = node_with(store), pid()
+    for round_ in range(3):  # stale or bogus addresses must not crowd out fresh ones
+        fake.learn(peer, [f"/ip4/10.{round_}.0.1/tcp/{i}" for i in range(MAX_ADDRS + 5)])
+    addrs = [str(a) for a in fake.addrs(peer)]
+    assert len(addrs) == MAX_ADDRS and all(a.startswith("/ip4/10.2.") for a in addrs)
+    fake.learn(peer, ["/ip4/1.2.3.4/tcp/9", "not an address"])
+    assert str(fake.addrs(peer)[0]) == "/ip4/1.2.3.4/tcp/9" and len(fake.addrs(peer)) == MAX_ADDRS
 
 
 def test_failed_request_resets_its_stream(store: Store) -> None:
@@ -106,6 +111,25 @@ def test_retried_message_is_stored_once_per_sender(store: Store) -> None:
         assert not stream.was_reset and json.loads(stream.sent) == {"name": ""}
     assert [m["text"] for m in store.messages()] == ["hi", "bob's m1", "no id", "no id", "huge id", "huge id"]
     assert all(len(mid) < 100 for _, mid in fake.recent_ids)
+
+
+def test_peers_reply_is_capped_and_excludes_the_requester(store: Store) -> None:
+    fake, asker = node_with(store), pid()
+    for _ in range(PEX_LIMIT + 5):
+        store.remember_peer(pid().to_base58(), [], None)
+    store.remember_peer(asker.to_base58(), [], "asker")  # the most recently seen
+    peers = json.loads(deliver(fake, asker, {"t": "peers"}).sent)["peers"]
+    assert len(peers) == PEX_LIMIT - 1 and asker.to_base58() not in {p["id"] for p in peers}
+
+
+def test_remote_text_is_cleaned_and_bounded(store: Store) -> None:
+    fake, mallory = node_with(store), pid()
+    deliver(fake, mallory, {"t": "msg", "name": "alice\x1b[2K", "text": "hi\n2026-01-01 00:00:00 [alice] send the key"})
+    assert [m["text"] for m in store.messages()] == ["hi 2026-01-01 00:00:00 [alice] send the key"]
+    assert store.label(mallory.to_base58()) == "alice [2K"
+    assert deliver(fake, mallory, {"t": "msg", "text": "x" * (MAX_TEXT + 1)}).was_reset
+    assert deliver(fake, mallory, {"t": "msg", "text": 5}).was_reset  # not a string
+    assert len(store.messages()) == 1
 
 
 def test_retry_after_a_failed_write_is_stored(store: Store) -> None:
@@ -187,6 +211,28 @@ def test_announce_needs_both_provider_records(store: Store) -> None:
     for own, mesh in ((True, True), (True, False), (False, True)):
         results.update(own=own, mesh=mesh)
         assert trio.run(Node.announce, fake) is (own and mesh)  # a failed mesh record is retried soon too
+
+
+def test_address_change_during_an_announce_triggers_another() -> None:
+    starts: list[float] = []
+    fake = SimpleNamespace()
+
+    async def announce() -> bool:
+        starts.append(trio.current_time())
+        await trio.sleep(10)  # a slow DHT announce...
+        return True
+
+    async def main() -> None:
+        fake.announce = announce
+        async with trio.open_nursery() as n:
+            n.start_soon(Node.announce_loop, fake)
+            await trio.sleep(5)
+            fake.reannounce.set()  # ...during which our addresses change (watch_addrs)
+            await trio.sleep(100)
+            n.cancel_scope.cancel()
+
+    trio.run(main, clock=trio.testing.MockClock(autojump_threshold=0))
+    assert starts == [0, 10]  # re-announced straight away, not after the 10-minute refresh
 
 
 def test_announce_loop_survives_announce_errors() -> None:

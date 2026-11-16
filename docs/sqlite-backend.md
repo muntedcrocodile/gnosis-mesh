@@ -45,7 +45,7 @@ point lookup or range scan.
   contains every peer, so it exceeds `MAX_MSG` (1 MiB) at about 2700 peers. The requester's `read_all` then raises
   `message too large`. Mesh discovery makes it easy to reach that many peers. The prototype limits the reply to the
   200 most recently seen peers (`PEX_LIMIT`), with usernames capped at `MAX_NAME` (64) characters and addresses at
-  `MAX_ADDRS` (32) per peer, so a reply stays well under `MAX_MSG`.
+  `MAX_ADDRS` (16) per peer, so a reply stays well under `MAX_MSG` (about 0.6 MB at worst).
 
 ## 2. stdlib `sqlite3` vs async drivers under trio
 
@@ -73,17 +73,17 @@ point lookup or range scan.
   `Store`, which only one worker thread uses at a time (enforced by the limiter), so no connection is ever shared
   between threads at once. SQLite's file locking serialises the two connections exactly as it does the CLI and the
   daemon.
-* **One rule still matters: never hold a transaction across an `await`.** Every Store method is self-contained:
-  each `_tx()` opens and commits within one synchronous call on one thread.
+* **No transactions span an `await`.** Every write is a single autocommit statement, run within one synchronous
+  call on one thread.
 * **When to reconsider.** If the daemon starts running heavy queries, such as full-text search over a large
   history or bulk exports, run them through `AsyncStore.run(...)` too.
 
 ## 3. WAL mode and CLI + daemon concurrency
 
-Each process opens one connection with these settings:
+The CLI opens one connection and the daemon two (its own and `AsyncStore`'s), all with these settings:
 
 ```python
-sqlite3.connect(path, isolation_level=None, timeout=5)  # autocommit; timeout = busy_timeout
+sqlite3.connect(path, isolation_level=None, timeout=5, check_same_thread=False)  # autocommit; timeout = busy_timeout
 PRAGMA journal_mode=WAL      # readers never block the writer and vice versa; persists in the file
 PRAGMA synchronous=NORMAL    # no fsync per commit; safe against app crashes; an OS crash may lose the last commit
 ```
@@ -91,11 +91,10 @@ PRAGMA synchronous=NORMAL    # no fsync per commit; safe against app crashes; an
 * **One writer at a time, and readers never wait.** `read -f` and `status` never block the daemon, and the daemon
   never blocks them. When writers overlap (the daemon's `remember_peer` and the CLI's `block`), one of them waits up
   to `busy_timeout`.
-* **Read-modify-write uses `BEGIN IMMEDIATE`** (`Store._tx`). A deferred transaction that starts as a reader and
-  then tries to write fails with `SQLITE_BUSY` straight away, without honouring `busy_timeout`, when another
-  writer got in first. Taking the write lock up front avoids that. Most writes are now single atomic statements
-  anyway: an `UPSERT` for peers, `INSERT OR IGNORE` for blocks, `INSERT OR REPLACE` for nicknames. The CLI no
-  longer reads the whole config, edits it and writes it back.
+* **Every write is one atomic statement**: an `UPSERT` for peers, `INSERT OR IGNORE` for blocks, `INSERT OR
+  REPLACE` for nicknames and settings, and a plain `DELETE` per pruning rule (the two rules needn't be atomic
+  together). No read-modify-write remains, so no explicit transaction is needed. The CLI no longer reads the whole
+  config, edits it and writes it back.
 * **Caveats.**
   * WAL needs shared memory (the `-shm` file), so it doesn't work when `--home` is on a network filesystem such as
     NFS or SMB. The old JSON files didn't fully work there either. If this matters, fall back to
@@ -144,9 +143,6 @@ New methods were added for the hot paths:
 | `messages(peer, last, after, include_blocked)`, `last_message_id()` | Python-side filtering of the whole history |
 
 ### Call-site changes outside `Store`
-
-The changes are deliberately small. None of them touch the mesh-discovery code (`discover`, `find_mesh_peers`,
-`announce`).
 
 * `Node.blocked` calls `store.is_blocked`.
 * `Node.remember` and message logging are awaited through `AsyncStore` (see section 2).
@@ -211,7 +207,7 @@ database by hand and still rewrite the whole peers file on every request.
 
 ## Tests
 
-`.venv/bin/python -m pytest` runs 29 tests in about 5 seconds:
+`.venv/bin/python -m pytest` runs 37 tests in about 9 seconds:
 
 * `tests/test_store.py`: round-trips for config, nicknames, blocks, peers (`UPSERT` semantics and ordering),
   pruning (age, cap, exemptions, hourly trigger), messages (filters, `last`, `after`, blocked), `label`/`resolve`,
@@ -222,9 +218,17 @@ database by hand and still rewrite the whole peers file on every request.
 * `tests/test_async.py`: `AsyncStore` with 20 concurrent trio tasks (nothing lost, per-task order kept), a write
   lock held by another process without stalling the event loop (with an inline control), and cancellation while a
   write is blocked.
-* `tests/test_node.py`: `Node` logic with stand-ins for the host and streams. It covers peer-exchange intake caps,
-  `announce_loop` surviving errors, retried messages stored once, failed requests resetting their stream, blocked
-  peers losing relay reservations, and malformed control requests.
-* `tests/test_cli.py`: `username`/`nick`/`block`/`unblock`/`blocked`/`read`/`peers` against a temporary `--home`.
+* `tests/test_node.py`: real `Node` methods with a real libp2p peerstore and stand-in streams. It covers:
+  * peer-exchange replies capped and not added to the peerstore, and `learn` keeping the newest addresses;
+  * the `peers` reply's cap and requester exclusion;
+  * remote text cleaned of control characters and bounded;
+  * retried messages stored once per sender, and a retry after a failed write;
+  * a peer blocked mid-request refused;
+  * every relay RESERVE/CONNECT checked against the block list and the sender's identity;
+  * `announce` needing both provider records, re-announcing after an address change during an announce, and
+    surviving errors;
+  * malformed control requests and failed requests resetting their stream.
+* `tests/test_cli.py`: `username`/`nick`/`block`/`unblock`/`blocked`/`read`/`peers` against a temporary `--home`,
+  and a real `read -f` process that never replays a blocked peer's messages.
 
 A manual end-to-end check passed too: two `--private --no-mdns` daemons on temporary homes ran `send`, `read`, `read -f`, `peers` and `status` successfully.

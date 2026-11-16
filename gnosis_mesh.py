@@ -30,7 +30,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -70,8 +70,9 @@ RELAY_TARGET = 3  # public relay reservations to hold while behind NAT
 MESH_TARGET = 8  # chat peers to stay connected to; below this, discover() looks for more
 DIAL_ON_START = 64  # most recently seen known peers to reconnect to when the node starts
 MAX_NAME = 64  # longest username we store or pass on (a remote peer chooses it)
-MAX_ADDRS = 32  # most addresses we keep for one peer
-PEX_LIMIT = 200  # most recently seen peers to share in a "peers" reply (keeps it well under MAX_MSG)
+MAX_ADDRS = 16  # most addresses we keep for one peer (also all that race() ever dials)
+MAX_TEXT = 16 << 10  # longest chat message we accept
+PEX_LIMIT = 200  # most recently seen peers in a "peers" reply (with MAX_NAME/MAX_ADDRS, about 0.6 MB < MAX_MSG)
 IPFS_BOOTSTRAP = [  # public IPFS DHT entry points (Kubo defaults)
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
@@ -111,17 +112,17 @@ class Store:
     def __init__(self, home: Path) -> None:
         self.home = home
         home.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # AF_UNIX socket paths are limited to 108 bytes on Linux and 104 on macOS: use the first runtime dir whose
-        # socket path fits (/tmp always does), so a long $XDG_RUNTIME_DIR or $TMPDIR can't stop the node starting.
+        # AF_UNIX socket paths are limited to 108 bytes on Linux and 104 on macOS: use the first dir whose socket
+        # path fits, preferring the private (0700) home so no other local user can squat it; /tmp always fits.
         name = f"gnosis-mesh-{hashlib.sha1(str(home.resolve()).encode()).hexdigest()[:12]}.sock"
-        for run_dir in (os.environ.get("XDG_RUNTIME_DIR"), tempfile.gettempdir(), "/tmp"):
+        for run_dir in (str(home.resolve()), os.environ.get("XDG_RUNTIME_DIR"), tempfile.gettempdir(), "/tmp"):
             self.sock = os.path.join(run_dir or "/tmp", name)
             if len(self.sock.encode()) < 104:
                 break
         self.db_path = home / "store.db"
         if not self.db_path.exists():  # messages are private: create the db (SQLite copies its mode to -wal/-shm) 0600
             os.close(os.open(self.db_path, os.O_WRONLY | os.O_CREAT, 0o600))
-        # Autocommit; writes that must be atomic use _tx(). WAL lets readers proceed while one writer commits;
+        # Autocommit: every write is a single statement. WAL lets readers proceed while one writer commits;
         # busy_timeout covers the brief writer-vs-writer overlap. Not tied to the creating thread so AsyncStore can
         # use its own Store from worker threads, but only one thread may use a Store at a time.
         self.db = sqlite3.connect(self.db_path, isolation_level=None, timeout=5, check_same_thread=False)
@@ -134,17 +135,6 @@ class Store:
     def close(self) -> None:
         self.db.close()
 
-    @contextlib.contextmanager
-    def _tx(self) -> Iterator[sqlite3.Connection]:
-        """A write transaction that takes the write lock up front (so read-modify-write can't lose updates)."""
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            yield self.db
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
-        self.db.execute("COMMIT")
-
     # --- config: username, nicknames, block list ---
     def config(self) -> Json:
         cfg: Json = {"username": "", **{r[0]: json.loads(r[1]) for r in self.db.execute("SELECT * FROM settings")}}
@@ -154,8 +144,7 @@ class Store:
 
     def set_config(self, **kw: Any) -> None:
         """Set plain settings such as username (nicknames and blocks have set_nick / block / unblock)."""
-        with self._tx() as db:
-            db.executemany("INSERT OR REPLACE INTO settings VALUES (?, ?)", ((k, json.dumps(v)) for k, v in kw.items()))
+        self.db.executemany("INSERT OR REPLACE INTO settings VALUES (?, ?)", ((k, json.dumps(v)) for k, v in kw.items()))
 
     def username(self) -> str:
         row = self.db.execute("SELECT value FROM settings WHERE key = 'username'").fetchone()
@@ -213,10 +202,9 @@ class Store:
         ttl, keep = self.PEER_TTL if ttl is None else ttl, self.MAX_PEERS if keep is None else keep
         kept = "pid NOT IN (SELECT pid FROM nicks) AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.peer = pid)"
         self._last_prune = time.time()
-        with self._tx() as db:
-            n = db.execute(f"DELETE FROM peers WHERE seen < ? AND {kept}", (time.time() - ttl,)).rowcount
-            n += db.execute(f"DELETE FROM peers WHERE {kept} AND rowid NOT IN "
-                            "(SELECT rowid FROM peers ORDER BY seen DESC LIMIT ?)", (keep,)).rowcount
+        n = self.db.execute(f"DELETE FROM peers WHERE seen < ? AND {kept}", (time.time() - ttl,)).rowcount
+        n += self.db.execute(f"DELETE FROM peers WHERE {kept} AND rowid NOT IN "
+                             "(SELECT rowid FROM peers ORDER BY seen DESC LIMIT ?)", (keep,)).rowcount
         if n:
             log.info("pruned %d stale peers", n)
         return n
@@ -224,9 +212,13 @@ class Store:
     # --- identity ---
     def key_seed(self) -> bytes:
         p = self.home / "key"
-        if not p.exists():
-            p.write_bytes(os.urandom(32))
-            p.chmod(0o600)
+        if not p.exists():  # write a private temp file, then link it into place: if two first starts race, both
+            tmp = self.home / f".key-{os.getpid()}"  # end up reading whichever key was linked first
+            with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
+                f.write(os.urandom(32))
+            with contextlib.suppress(FileExistsError):
+                os.link(tmp, p)
+            tmp.unlink()
         return p.read_bytes()
 
     # --- message history ---
@@ -240,7 +232,7 @@ class Store:
     def messages(self, peer: str | None = None, last: int | None = None, after: int = 0,
                  include_blocked: bool = True) -> list[Json]:
         """History in order, as {id, ts, peer, dir, text}: optionally one peer's, only the `last` N, only those with
-        id > `after` (for following), without blocked peers. No arguments returns everything, as before."""
+        id > `after` (for following), without blocked peers. No arguments returns everything."""
         where, args = ["id > ?"], [after]
         if peer is not None:
             where.append("peer = ?")
@@ -309,6 +301,11 @@ async def read_all(stream: INetStream) -> bytes:
     except StreamEOF:
         pass
     return buf
+
+
+def clean(s: str) -> str:
+    """Remote text with control characters (newlines, terminal escapes) replaced, so it can't forge output lines."""
+    return "".join(c if c.isprintable() else " " for c in s)
 
 
 def is_circuit(addr: Multiaddr) -> bool:
@@ -429,16 +426,19 @@ class Node:
         return addrs
 
     def learn(self, pid: ID, addrs: list[str]) -> None:
-        """Add addresses for pid, at most MAX_ADDRS in total: a peer-exchange reply can name any peer, any number of
-        times, and the peerstore keeps every distinct address it is given."""
+        """Add addresses for pid, newest first, keeping at most MAX_ADDRS: the peerstore would keep every distinct
+        address it's given, and stale or bogus ones must not crowd out fresh ones."""
         ma = []
-        for a in list(addrs)[:max(0, MAX_ADDRS - len(self.addrs(pid)))]:
+        for a in (addrs if isinstance(addrs, list) else [])[:MAX_ADDRS]:
             try:
                 ma.append(Multiaddr(a))
             except Exception:
                 pass
         if ma and pid != self.host.get_id():
-            self.host.get_peerstore().add_addrs(pid, ma, PERMANENT_ADDR_TTL)
+            ps = self.host.get_peerstore()
+            old = [a for a in self.addrs(pid) if a not in ma]
+            ps.clear_addrs(pid)
+            ps.add_addrs(pid, (ma + old)[:MAX_ADDRS], PERMANENT_ADDR_TTL)
 
     def speaks(self, pid: ID, proto: str) -> bool:
         try:
@@ -451,8 +451,7 @@ class Node:
 
     def link(self, pid: ID) -> str:
         """'direct' if any connection to pid is direct (e.g. after DCUtR hole punching), else 'relayed'."""
-        conns: Any = getattr(self.host.get_network(), "connections", {}).get(pid, [])
-        for c in conns if isinstance(conns, list) else [conns]:
+        for c in self.host.get_network().connections.get(pid, []):  # type: ignore[attr-defined]
             try:
                 if not any(is_circuit(a) for a in c.get_transport_addresses()):
                     return "direct"
@@ -465,7 +464,7 @@ class Node:
 
     async def remember(self, pid: ID, name: str | None) -> None:
         """Record an encountered chat peer (with its self-assigned username) in the store."""
-        name = name[:MAX_NAME] if isinstance(name, str) else None  # untrusted: it's stored and re-shared via PEX
+        name = clean(name)[:MAX_NAME] if isinstance(name, str) else None  # untrusted: stored and re-shared via PEX
         await self.astore.remember_peer(pid.to_base58(), [str(a) for a in self.addrs(pid)][:MAX_ADDRS], name)
 
     # --- the /gnosis-mesh protocol: one JSON request + one JSON reply per stream ---
@@ -475,27 +474,30 @@ class Node:
             await stream.reset()
             return
         try:
-            with trio.fail_after(30):  # a peer that never finishes its request mustn't hold the handler forever
+            with trio.fail_after(30):  # a peer that stalls its request or our reply mustn't hold the handler forever
                 req = json.loads(await read_all(stream))
-            if self.blocked(pid.to_base58()):  # blocked while the request was arriving
-                raise PermissionError("blocked")
-            reply: Json = {"name": self.store.username()}
-            if req["t"] == "msg":
-                mid = req.get("id")  # older peers send none; a retry of a delivered message is dropped
-                key = (pid, mid) if isinstance(mid, str) and len(mid) <= 64 else None
-                if key is None or key not in self.recent_ids:
-                    await self.astore.log_message(pid.to_base58(), "in", req["text"])
-                    if key:  # only once stored, so a retry after a failed write is stored after all
-                        self.recent_ids.append(key)
-                    if self.echo:
-                        click.echo(f"\n[{self.store.label(pid.to_base58())}] {req['text']}")
-            elif req["t"] == "peers":
-                reply["peers"] = [{"id": k, **v} for k, v in self.store.recent_peers(PEX_LIMIT).items()
-                                  if k != pid.to_base58()]
-            await self.remember(pid, req.get("name"))
-            await stream.write(json.dumps(reply).encode())
-            await stream.close()
-            self.greeted.add(pid)
+                if self.blocked(pid.to_base58()):  # blocked while the request was arriving
+                    raise PermissionError("blocked")
+                reply: Json = {"name": self.store.username()}
+                if req["t"] == "msg":
+                    text = clean(req["text"])
+                    if len(text) > MAX_TEXT:
+                        raise ValueError("message too long")
+                    mid = req.get("id")  # older peers send none; a retry of a delivered message is dropped
+                    key = (pid, mid) if isinstance(mid, str) and len(mid) <= 64 else None
+                    if key is None or key not in self.recent_ids:
+                        await self.astore.log_message(pid.to_base58(), "in", text)
+                        if key:  # only once stored, so a retry after a failed write is stored after all
+                            self.recent_ids.append(key)
+                        if self.echo:
+                            click.echo(f"\n[{self.store.label(pid.to_base58())}] {text}")
+                elif req["t"] == "peers":
+                    reply["peers"] = [{"id": k, **v} for k, v in self.store.recent_peers(PEX_LIMIT).items()
+                                      if k != pid.to_base58()]
+                await self.remember(pid, req.get("name"))
+                await stream.write(json.dumps(reply).encode())
+                await stream.close()
+                self.greeted.add(pid)
         except Exception as e:
             log.debug("bad request from %s: %s", pid, e)
             await stream.reset()
@@ -513,21 +515,24 @@ class Node:
                     await stream.reset()
                 raise
         await self.remember(pid, reply.get("name"))
-        if isinstance(reply.get("peers"), list):  # peer exchange: learn addresses of (at most PEX_LIMIT) peers they met
-            reply["peers"] = reply["peers"][:PEX_LIMIT]
-            for p in reply["peers"]:
-                try:
-                    self.learn(ID.from_base58(p["id"]), p.get("addrs", []))
-                except Exception:
-                    pass
+        reply["peers"] = reply["peers"][:PEX_LIMIT] if isinstance(reply.get("peers"), list) else []
         return reply
 
-    async def greet(self, pid: ID, t: str = "hello") -> None:
-        """Exchange usernames (and optionally peer lists); silently ignores failures."""
+    async def exchange(self, other: ID) -> dict[ID, Any]:
+        """Peer exchange: {peer: addrs} of the chat peers `other` has met. Not learned here: a reply can name any
+        IDs, and adding them all to the peerstore would evict the peers we actually know (it holds 1000)."""
+        offered: dict[ID, Any] = {}
+        with contextlib.suppress(Exception):
+            for p in (await self.request(other, "peers"))["peers"]:
+                offered[ID.from_base58(p["id"])] = p.get("addrs", [])
+        return offered
+
+    async def greet(self, pid: ID) -> None:
+        """Exchange usernames; silently ignores failures."""
         try:
-            await self.request(pid, t)
+            await self.request(pid, "hello")
         except Exception as e:
-            log.debug("%s to %s failed: %s", t, pid, e)
+            log.debug("hello to %s failed: %s", pid, e)
 
     # --- connecting ---
     async def race(self, addrs: list[Multiaddr], dial: Callable[[Multiaddr], Awaitable[Any]]) -> bool:
@@ -560,8 +565,7 @@ class Node:
         # Stored/advertised circuit addrs usually omit the trailing /p2p/<target>, which the circuit dialer requires.
         relayed = [a if str(a).endswith(f"/p2p/{pid}") else Multiaddr(f"{a}/p2p/{pid}") for a in addrs if is_circuit(a)]
         net: Any = self.host.get_network()
-        if hasattr(net, "unblock_peer"):
-            net.unblock_peer(pid)  # don't let a recent failure on stale addresses block this attempt
+        net.unblock_peer(pid)  # don't let a recent failure on stale addresses block this attempt
         # Rendezvous: any chat peer we share with the target can relay for us (it holds a reservation from the
         # target), then DCUtR hole-punches a direct connection. Public relays the target advertised come last.
         # Tiers start staggered (direct, +2s shared peers, +4s public relays); the first success wins.
@@ -608,10 +612,13 @@ class Node:
         """Locate a peer by ID: known addrs, peer exchange, then DHT peer lookup + provider records in parallel."""
         if await self.try_connect(pid):
             return True
+        async def ask(other: ID) -> None:  # peer exchange, keeping only the target's addresses
+            if pid in (offered := await self.exchange(other)):
+                self.learn(pid, offered[pid])
         async with trio.open_nursery() as n:
             for other in self.host.get_connected_peers():
                 if self.store.has_peer(other.to_base58()):
-                    n.start_soon(self.greet, other, "peers")
+                    n.start_soon(ask, other)
         if await self.try_connect(pid):
             return True
         found = False
@@ -684,26 +691,25 @@ class Node:
             return True
         if self.dht.get_routing_table_size() == 0 and not have:
             return False  # nothing to ask yet; retry soon
-        candidates: set[ID] = set()
+        offered: dict[ID, Any] = {}  # candidate -> the addresses it was offered with
         async with trio.open_nursery() as n:
             async def from_dht() -> None:
                 with trio.move_on_after(60), contextlib.suppress(Exception):
                     for info in await self.find_mesh_peers():
-                        self.learn(info.peer_id, [str(a) for a in info.addrs])
-                        candidates.add(info.peer_id)
+                        offered[info.peer_id] = [str(a) for a in info.addrs]
 
-            async def from_peer(pid: ID) -> None:  # peer exchange (request() also learns their addresses)
-                with contextlib.suppress(Exception):
-                    candidates.update(ID.from_base58(p["id"]) for p in (await self.request(pid, "peers"))["peers"])
+            async def from_peer(pid: ID) -> None:
+                offered.update(await self.exchange(pid))
             n.start_soon(from_dht)
             for pid in have:
                 n.start_soon(from_peer, pid)
-        fresh = [p for p in candidates if p != self.host.get_id() and p not in have and not self.connected(p)
+        fresh = [p for p in offered if p != self.host.get_id() and p not in have and not self.connected(p)
                  and not self.blocked(p.to_base58())]
         random.shuffle(fresh)  # spread connections out instead of everyone piling onto the same few peers
         batch = fresh[:2 * (MESH_TARGET - len(have))]  # some will be offline or unreachable
         async with trio.open_nursery() as n:
             for pid in batch:
+                self.learn(pid, offered[pid])  # only the peers we dial
                 n.start_soon(self.try_connect, pid)
         log.info("discovery: %d chat peers connected (was %d), %d candidates, dialled %d",
                  len(self.chat_peers()), len(have), len(fresh), len(batch))
@@ -800,6 +806,7 @@ class Node:
 
     async def announce_loop(self) -> None:
         while True:
+            self.reannounce = trio.Event()  # before announcing: an address change during it must trigger another
             try:
                 announced = await self.announce()
             except Exception as e:  # a DHT error must not escape maintain() and take the node down
@@ -808,7 +815,6 @@ class Node:
             if not announced:
                 await trio.sleep(15)
                 continue
-            self.reannounce = trio.Event()
             with trio.move_on_after(600):  # refresh every 10 min, or right away when our addrs change
                 await self.reannounce.wait()
 
@@ -858,11 +864,11 @@ class Node:
                 buf += chunk
             req = json.loads(buf)
             try:
-                reply = await self.command(req)
+                with trio.fail_after(80):  # answer before the CLI gives up (90 s) rather than deliver after it has
+                    reply = await self.command(req)
             except Exception as e:
                 reply = {"error": str(e) or type(e).__name__}
             await conn.send_all(json.dumps(reply).encode() + b"\n")
-            await conn.aclose()
             if req.get("cmd") == "stop":
                 stop.cancel()
         except Exception as e:
@@ -945,7 +951,6 @@ class Node:
             os.chmod(self.store.sock, 0o600)  # before listen(): until then nobody can connect
             sock.listen()
             n.start_soon(trio.serve_listeners, lambda c: self.control(c, n.cancel_scope), [trio.SocketListener(sock)])
-        os.unlink(self.store.sock)
 
 
 # ---------- CLI ----------
@@ -1030,7 +1035,7 @@ def start(store: Store, port: int, bootstrap: tuple[str, ...], detach: bool, no_
         except KeyboardInterrupt:
             return
         except BaseException as e:
-            log.error("node crashed (%s: %s); restarting in 5s", type(e).__name__, e)
+            log.critical("node crashed (%s: %s); restarting in 5s", type(e).__name__, e)
             time.sleep(5)
         finally:
             peerDiscovery.unregister_peer_discovered_handler(node.found.put)
@@ -1131,7 +1136,7 @@ def peers(store: Store, source: str | None, named: bool) -> None:
         if named and not (nickname or name):
             continue
         flags = " [blocked]" if pid in cfg["blocked"] else ""
-        click.echo(f"{pid}  username={name or '-'}  nick={nickname or '-'}{flags}")
+        click.echo(clean(f"{pid}  username={name or '-'}  nick={nickname or '-'}{flags}"))
 
 
 @cli.command()

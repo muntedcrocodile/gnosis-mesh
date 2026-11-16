@@ -59,21 +59,27 @@ def test_follow_never_replays_a_blocked_peers_messages(home: Path) -> None:
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     proc = subprocess.Popen([sys.executable, "gnosis_mesh.py", "--home", str(home), "read", "-f"],
                             cwd=Path(__file__).parent.parent, stdout=subprocess.PIPE, text=True, env=env)
-    killer = threading.Timer(20, proc.kill)  # never hang the suite
+    killer = threading.Timer(60, proc.kill)  # never hang the suite
     killer.start()
-    try:
-        time.sleep(1.5)
-        s.log_message(b, "in", "hidden")
-        time.sleep(2.5)  # at least one poll passes while b is blocked
-        s.unblock(b)
-        s.log_message(a, "in", "visible")
-        seen = []
+    seen: list[str] = []
+
+    def say(peer: str, text: str) -> None:  # log a message and wait until the follower has printed it
+        s.log_message(peer, "in", text)
         while proc.stdout and (line := proc.stdout.readline()):
             seen.append(line)
-            if "visible" in line:
-                break
+            if text in line:
+                return
+        raise AssertionError(f"follower never printed {text!r}")
+
+    try:
+        say(a, "first")  # the follower is polling
+        s.log_message(b, "in", "hidden")
+        time.sleep(2.5)  # at least one 1 s poll passes with "hidden" as the newest message, while b is blocked
+        s.unblock(b)
+        say(a, "second")
     finally:
         proc.kill()
+        proc.wait()
         killer.cancel()
         s.close()
-    assert any("visible" in line for line in seen) and not any("hidden" in line for line in seen)
+    assert not any("hidden" in line for line in seen)
