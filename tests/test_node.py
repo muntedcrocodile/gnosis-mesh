@@ -1,12 +1,15 @@
 """Node logic that can run without a network: stand-ins for the libp2p host and stream."""
 from __future__ import annotations
 
+import collections
 import json
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 import trio
 import trio.testing
+from libp2p.peer.id import ID
 
 from conftest import new_pid
 from gnosis_mesh import MAX_ADDRS, PEX_LIMIT, AsyncStore, Node, Store
@@ -68,3 +71,79 @@ def test_announce_loop_survives_announce_errors() -> None:
 
     trio.run(main, clock=trio.testing.MockClock(autojump_threshold=0))
     assert calls >= 5  # kept retrying (every 15 s) instead of raising out of maintain()
+
+
+class InboundStream(FakeStream):
+    def __init__(self, request: Any, peer: ID) -> None:
+        super().__init__(request)
+        self.muxed_conn = SimpleNamespace(peer_id=peer)
+        self.was_reset = False
+
+    async def reset(self) -> None:
+        self.was_reset = True
+
+
+def node_with(store: Store) -> SimpleNamespace:
+    fake = SimpleNamespace(store=store, astore=AsyncStore(store.home), addrs=lambda _: [], echo=False,
+                           greeted=set(), recent_ids=collections.deque(maxlen=1000))
+    fake.blocked = lambda pid: Node.blocked(fake, pid)  # type: ignore[arg-type]
+    fake.remember = lambda pid, name: Node.remember(fake, pid, name)  # type: ignore[arg-type]
+    return fake
+
+
+def test_retried_message_is_stored_once(store: Store) -> None:
+    fake, alice = node_with(store), ID.from_base58(new_pid())
+    for request in ({"t": "msg", "text": "hi", "id": "m1"}, {"t": "msg", "text": "hi", "id": "m1"},
+                    {"t": "msg", "text": "old peer"}, {"t": "msg", "text": "old peer"}):  # no id: never deduplicated
+        stream = InboundStream(request, alice)
+        trio.run(Node.handle, fake, stream)  # type: ignore[arg-type]
+        assert not stream.was_reset and json.loads(stream.sent) == {"name": ""}
+    assert [m["text"] for m in store.messages()] == ["hi", "old peer", "old peer"]
+
+
+def test_failed_request_resets_its_stream(store: Store) -> None:
+    stream = InboundStream("ignored", ID.from_base58(new_pid()))
+    stream.reply = b"not json"
+
+    async def new_stream(*_: Any) -> FakeStream:
+        return stream
+
+    fake = node_with(store)
+    fake.host = SimpleNamespace(new_stream=new_stream)
+    with pytest.raises(json.JSONDecodeError):
+        trio.run(Node.request, fake, SimpleNamespace(to_base58=lambda: "bob"), "hello")  # type: ignore[arg-type]
+    assert stream.was_reset
+
+
+def test_blocked_peers_lose_their_relay_reservation(store: Store) -> None:
+    a, b = ID.from_base58(new_pid()), ID.from_base58(new_pid())
+    store.block(b.to_base58())
+    reservations = {a: object(), b: object()}
+    fake = node_with(store)
+    fake.circuit = SimpleNamespace(resource_manager=SimpleNamespace(_reservations=reservations))
+    fake.speaks = lambda *_: False
+    stream = InboundStream({}, a)
+    trio.run(Node.hop_acl, fake, stream)  # type: ignore[arg-type]
+    assert list(reservations) == [a]  # nobody can reach b through us any more
+
+
+def test_malformed_control_request_does_not_escape() -> None:
+    class Conn:
+        def __init__(self) -> None:
+            self.data, self.sent = b"[]", b""
+
+        async def receive_some(self, n: int) -> bytes:
+            chunk, self.data = self.data, b""
+            return chunk
+
+        async def send_all(self, data: bytes) -> None:
+            self.sent += data
+
+        async def aclose(self) -> None:
+            pass
+
+    fake = SimpleNamespace()
+    fake.command = lambda req: Node.command(fake, req)  # type: ignore[arg-type]
+    conn = Conn()
+    trio.run(Node.control, fake, conn, trio.CancelScope())  # type: ignore[arg-type]
+    assert "error" in json.loads(conn.sent)

@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import functools
 import hashlib
@@ -70,7 +71,7 @@ RELAY_TARGET = 3  # public relay reservations to hold while behind NAT
 MESH_TARGET = 8  # chat peers to stay connected to; below this, discover() looks for more
 DIAL_ON_START = 64  # most recently seen known peers to reconnect to when the node starts
 MAX_NAME = 64  # longest username we store or pass on (a remote peer chooses it)
-MAX_ADDRS = 32  # most addresses we accept for one peer from a peer-exchange reply
+MAX_ADDRS = 32  # most addresses we store or accept via peer exchange for one peer
 PEX_LIMIT = 200  # most recently seen peers to share in a "peers" reply (keeps it well under MAX_MSG)
 IPFS_BOOTSTRAP = [  # public IPFS DHT entry points (Kubo defaults)
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
@@ -124,7 +125,7 @@ class Store:
 
     def __init__(self, home: Path) -> None:
         self.home = home
-        home.mkdir(parents=True, exist_ok=True)
+        home.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.sock = socket_path(home)
         self.db_path = home / "store.db"
         if not self.db_path.exists():  # messages are private: create the db (SQLite copies its mode to -wal/-shm) 0600
@@ -327,19 +328,21 @@ class Store:
         return (nick and nick[0]) or (name and name[0]) or f"{pid[:6]}…{pid[-6:]}"
 
     def resolve(self, who: str) -> str:
-        """Map a nickname, username or peer ID to a peer ID (local nicknames win over self-chosen usernames)."""
+        """Map a nickname, peer ID or username to a peer ID. Usernames come last: a peer chooses its own, so one
+        could otherwise claim another peer's ID as its name and receive messages meant for that peer."""
         if nicked := self.db.execute("SELECT pid FROM nicks WHERE nick = ? LIMIT 1", (who,)).fetchone():
             return nicked[0]
+        try:
+            multihash.decode(ID.from_base58(who).to_bytes())
+            return who
+        except Exception:
+            pass
         named = [r[0] for r in self.db.execute("SELECT pid FROM peers WHERE name = ? ORDER BY rowid", (who,))]
         if len(named) > 1:
             raise click.ClickException(f"username '{who}' is ambiguous ({', '.join(named)}); use a peer ID or nickname")
         if named:
             return named[0]
-        try:
-            multihash.decode(ID.from_base58(who).to_bytes())
-            return who
-        except Exception:
-            raise click.ClickException(f"'{who}' is not a known nickname, username or valid peer ID")
+        raise click.ClickException(f"'{who}' is not a known nickname, username or valid peer ID")
 
 
 class AsyncStore:
@@ -454,6 +457,7 @@ class Node:
         self.autonat = AutoNATService(self.host)  # type: ignore[arg-type]
         self.reachability = AutoNATStatus.UNKNOWN
         self.greeted: set[ID] = set()
+        self.recent_ids: collections.deque[str | None] = collections.deque(maxlen=1000)  # of delivered messages
         self.dial_errors: list[str] = []
         self.upnp_ports: list[tuple[str, str]] = []
         self.last_addrs: set[str] = set()
@@ -527,7 +531,7 @@ class Node:
     async def remember(self, pid: ID, name: str | None) -> None:
         """Record an encountered chat peer (with its self-assigned username) in the store."""
         name = name[:MAX_NAME] if isinstance(name, str) else None  # untrusted: it's stored and re-shared via PEX
-        await self.astore.remember_peer(pid.to_base58(), [str(a) for a in self.addrs(pid)], name)
+        await self.astore.remember_peer(pid.to_base58(), [str(a) for a in self.addrs(pid)][:MAX_ADDRS], name)
 
     # --- the /gnosis-mesh protocol: one JSON request + one JSON reply per stream ---
     async def handle(self, stream: INetStream) -> None:
@@ -536,13 +540,17 @@ class Node:
             await stream.reset()
             return
         try:
-            req = json.loads(await read_all(stream))
+            with trio.fail_after(30):  # a peer that never finishes its request mustn't hold the handler forever
+                req = json.loads(await read_all(stream))
             await self.remember(pid, req.get("name"))
             reply: Json = {"name": self.store.username()}
             if req["t"] == "msg":
-                await self.astore.log_message(pid.to_base58(), "in", req["text"])
-                if self.echo:
-                    click.echo(f"\n[{self.store.label(pid.to_base58())}] {req['text']}")
+                mid = req.get("id")  # older peers send none
+                if mid is None or mid not in self.recent_ids:  # a retry of a delivered message is dropped
+                    self.recent_ids.append(mid)
+                    await self.astore.log_message(pid.to_base58(), "in", req["text"])
+                    if self.echo:
+                        click.echo(f"\n[{self.store.label(pid.to_base58())}] {req['text']}")
             elif req["t"] == "peers":
                 reply["peers"] = [{"id": k, **v} for k, v in self.store.recent_peers(PEX_LIMIT, exclude_blocked=True).items()
                                   if k != pid.to_base58()]
@@ -556,10 +564,15 @@ class Node:
     async def request(self, pid: ID, t: str, **body: Any) -> Json:
         with trio.fail_after(30):
             stream = await self.host.new_stream(pid, [PROTO])
-            await stream.write(json.dumps({"t": t, "name": self.store.username(), **body}).encode())
-            await stream.close_write()  # type: ignore[attr-defined]  # NetStream has it; the ABC doesn't
-            reply = json.loads(await read_all(stream))
-            await stream.close()
+            try:
+                await stream.write(json.dumps({"t": t, "name": self.store.username(), **body}).encode())
+                await stream.close_write()  # type: ignore[attr-defined]  # NetStream has it; the ABC doesn't
+                reply = json.loads(await read_all(stream))
+                await stream.close()
+            except BaseException:  # bad reply, too big, too slow or cancelled: don't leave the stream open
+                with trio.move_on_after(1, shield=True):
+                    await stream.reset()
+                raise
         await self.remember(pid, reply.get("name"))
         if isinstance(reply.get("peers"), list):  # peer exchange: learn addresses of (at most PEX_LIMIT) peers they met
             reply["peers"] = reply["peers"][:PEX_LIMIT]
@@ -791,6 +804,9 @@ class Node:
     async def hop_acl(self, stream: INetStream) -> None:
         """Relay only for fellow chat peers (we are a rendezvous point for them, not a public relay)."""
         pid = stream.muxed_conn.peer_id
+        reservations = self.circuit.resource_manager._reservations  # the library checks only that a target has one,
+        for p in [p for p in reservations if self.blocked(p.to_base58())]:  # so drop those of blocked peers
+            del reservations[p]
         if self.speaks(pid, PROTO) and not self.blocked(pid.to_base58()):
             await self.relay_hop(stream)
         else:
@@ -917,7 +933,6 @@ class Node:
 
     # --- local control socket used by the CLI ---
     async def control(self, conn: trio.SocketStream, stop: trio.CancelScope) -> None:
-        req: Json = {}
         try:  # a misbehaving or impatient client must never take the daemon down
             buf = b""
             while chunk := await conn.receive_some(65536):
@@ -929,10 +944,10 @@ class Node:
                 reply = {"error": str(e) or type(e).__name__}
             await conn.send_all(json.dumps(reply).encode() + b"\n")
             await conn.aclose()
+            if req.get("cmd") == "stop":
+                stop.cancel()
         except Exception as e:
             log.debug("control connection failed: %s", e)
-        if req.get("cmd") == "stop":
-            stop.cancel()
 
     async def command(self, req: Json) -> Json:
         if req["cmd"] == "status":
@@ -947,12 +962,13 @@ class Node:
             return {}
         pid = ID.from_base58(req["peer"])
         error = "not found"
+        mid = os.urandom(8).hex()  # the same for every attempt, so the recipient can drop duplicates
         for attempt in range(3):  # a connection can vanish right after connecting (relay limits, DCUtR handover)
             if not await self.find(pid):
                 return {"error": f"could not reach {req['peer']}"}
             try:
                 if req["cmd"] == "send":
-                    await self.request(pid, "msg", text=req["text"])
+                    await self.request(pid, "msg", text=req["text"], id=mid)
                     await self.astore.log_message(req["peer"], "out", req["text"])
                     return {}
                 if req["cmd"] == "peers":
@@ -1073,7 +1089,7 @@ def start(store: Store, port: int, bootstrap: tuple[str, ...], detach: bool, no_
         args = [sys.executable, __file__, "--home", str(store.home), "start", "-p", str(port)]
         args += [x for b in bootstrap for x in ("-b", b)] + ["-v"] * verbose
         args += (["--no-mdns"] if no_mdns else []) + (["--private"] if private else [])
-        with open(store.home / "daemon.log", "a") as logfile:
+        with open(os.open(store.home / "daemon.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "a") as logfile:
             subprocess.Popen(args, stdout=logfile, stderr=logfile, stdin=subprocess.DEVNULL, start_new_session=True)
         for _ in range(300):
             time.sleep(0.2)

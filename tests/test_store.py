@@ -148,6 +148,8 @@ def test_resolve(store: Store) -> None:
     assert store.resolve("alice") == c
     assert store.resolve(a) == a
     assert store.resolve(new_pid()) != ""  # any valid peer ID passes through
+    store.remember_peer(new_pid(), [], a)  # a peer claiming a's ID as its username can't hijack it
+    assert store.resolve(a) == a
     with pytest.raises(click.ClickException, match="ambiguous"):
         store.resolve("dup")
     with pytest.raises(click.ClickException, match="not a known"):
@@ -164,6 +166,7 @@ def test_key_seed_stays_a_private_file(store: Store, home: Path) -> None:
 
 def test_db_is_private_and_in_wal_mode(store: Store, home: Path) -> None:
     assert stat.S_IMODE((home / "store.db").stat().st_mode) == 0o600
+    assert stat.S_IMODE(home.stat().st_mode) == 0o700
     assert store.db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
 
 

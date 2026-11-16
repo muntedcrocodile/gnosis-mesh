@@ -5,8 +5,10 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
+import pytest
 import trio
 
 from gnosis_mesh import AsyncStore, Store
@@ -40,6 +42,15 @@ class LockHolder:
         assert self.proc.wait(timeout=10) == 0
 
 
+@pytest.fixture
+def lock(store: Store, home: Path) -> Iterator[LockHolder]:
+    holder = LockHolder(home)
+    yield holder
+    if holder.proc.poll() is None:  # a failed test must not leave the holder running
+        holder.proc.kill()
+        holder.proc.wait()
+
+
 def test_concurrent_trio_tasks_lose_nothing_and_keep_order(store: Store) -> None:
     astore = AsyncStore(store.home)
 
@@ -61,9 +72,8 @@ def test_concurrent_trio_tasks_lose_nothing_and_keep_order(store: Store) -> None
         assert store.label(f"t{t}") == f"name{t}-24"
 
 
-def test_waiting_on_another_process_does_not_block_the_event_loop(store: Store, home: Path) -> None:
+def test_waiting_on_another_process_does_not_block_the_event_loop(store: Store, lock: LockHolder) -> None:
     astore = AsyncStore(store.home)
-    holder = LockHolder(home)
     gaps: list[float] = []
 
     async def main() -> None:
@@ -82,7 +92,7 @@ def test_waiting_on_another_process_does_not_block_the_event_loop(store: Store, 
                 await trio.sleep(0.5)  # the writes are stuck behind the other process's lock...
                 assert store.messages() == []
                 assert store.peers() == {}  # ...and reads still work (WAL)
-                await trio.to_thread.run_sync(holder.release)
+                await trio.to_thread.run_sync(lock.release)
             n.cancel_scope.cancel()
 
     trio.run(main)
@@ -91,34 +101,32 @@ def test_waiting_on_another_process_does_not_block_the_event_loop(store: Store, 
     assert max(gaps) < 0.25, f"event loop stalled for {max(gaps):.2f}s"
 
 
-def test_sync_write_would_have_stalled(home: Path) -> None:
+def test_sync_write_would_have_stalled(store: Store, lock: LockHolder) -> None:
     """Control for the test above: the same wait done inline blocks the calling thread for the whole lock."""
-    store = Store(home)
-    holder = LockHolder(home)
-    timer = threading.Timer(0.3, holder.release)
+    timer = threading.Timer(0.3, lock.release)
     timer.start()
     t0 = time.monotonic()
     store.log_message("p", "in", "x")
     assert time.monotonic() - t0 >= 0.25
     timer.join()
-    store.close()
 
 
-def test_cancelled_write_still_completes_exactly_once(store: Store, home: Path) -> None:
+def test_cancelled_write_still_completes_exactly_once(store: Store, lock: LockHolder) -> None:
     astore = AsyncStore(store.home)
-    holder = LockHolder(home)
+    timer = threading.Timer(0.4, lock.release)  # released from outside trio, well after the cancellation
+    timer.start()
 
-    async def main() -> None:
-        with trio.move_on_after(0.2) as scope:
-            async with trio.open_nursery() as n:
-                n.start_soon(astore.log_message, "p", "in", "cancelled mid-wait")
-                await trio.sleep(0.1)
-                n.start_soon(trio.to_thread.run_sync, holder.release)
-                await trio.sleep_forever()
-        assert scope.cancelled_caught
+    async def main() -> float:
+        t0 = trio.current_time()
+        with trio.move_on_after(0.2) as scope:  # cancelled while the write is still blocked on the lock
+            await astore.log_message("p", "in", "cancelled mid-wait")
+        assert scope.cancel_called  # the deadline passed mid-write...
+        return trio.current_time() - t0
 
-    trio.run(main)
+    elapsed = trio.run(main)
+    timer.join()
+    assert elapsed >= 0.35  # ...yet the call waited for the write rather than abandoning it mid-transaction
     assert [m["text"] for m in store.messages()] == ["cancelled mid-wait"]
-    assert astore.store.db.in_transaction is False  # nothing left open on the writer connection
+    assert astore.store.db.in_transaction is False
     store.log_message("p", "in", "after")  # and the store still works
     assert len(store.messages()) == 2

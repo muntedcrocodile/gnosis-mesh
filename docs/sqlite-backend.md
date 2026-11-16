@@ -44,8 +44,9 @@ point lookup or range scan.
   (`tests/test_concurrency.py`) loses nothing.
 * **Peer exchange stops working at about 2700 peers.** One `peers` reply entry is about 384 bytes, and the reply
   contains every peer, so it exceeds `MAX_MSG` (1 MiB) at about 2700 peers. The requester's `read_all` then raises
-  `message too large`. The pending mesh-discovery work makes it easy to reach that many peers. The prototype limits
-  the reply to the 200 most recently seen peers (`PEX_LIMIT`).
+  `message too large`. Mesh discovery makes it easy to reach that many peers. The prototype limits the reply to the
+  200 most recently seen peers (`PEX_LIMIT`), with usernames capped at `MAX_NAME` (64) characters and addresses at
+  `MAX_ADDRS` (32) per peer, so a reply stays well under `MAX_MSG`.
 
 ## 2. stdlib `sqlite3` vs async drivers under trio
 
@@ -56,7 +57,7 @@ point lookup or range scan.
   `trio.to_thread.run_sync` is the honest way to do it.
 * **Writes can block for seconds, so they go to a thread.** A write waits up to `busy_timeout` (5 s) whenever
   another process holds the write lock, for example the CLI running `block`, `nick` or a startup prune. Run inline,
-  that wait freezes the daemon's whole event loop, networking included. `AsyncStore` runs `remember_peer`,
+  that wait freezes the daemon's whole event loop, networking included. `AsyncStore` runs `remember_peer` and
   `log_message` in a worker thread instead. The hop costs about 90 µs per write (about 41 µs inline
   versus about 129 µs threaded), which is negligible next to a network round trip.
   `tests/test_async.py` holds the lock from another process for 0.5 s and checks that the event loop never pauses
@@ -148,11 +149,11 @@ New methods were added for the hot paths:
 A small refactor moved the socket-path calculation out of `Store.__init__` into `socket_path(home)`, so the
 migration guard and the tests can use it. `store.sock` is unchanged.
 
-The changes are deliberately small. None of them touch `discover`, `find_mesh_peers`, `exchange`, `chat_peers`,
-`MESH_KEY` or `announce`.
+The changes are deliberately small. None of them touch the mesh-discovery code (`discover`, `find_mesh_peers`,
+`exchange`).
 
 * `Node.blocked` calls `store.is_blocked`.
-* `Node.remember` calls `store.remember_peer`.
+* `Node.remember` and message logging are awaited through `AsyncStore` (see section 2).
 * `Node.handle`: the `peers` reply uses `store.recent_peers(PEX_LIMIT, exclude_blocked=True)`.
 * `Node.find` and the `status` command use `store.has_peer` instead of loading every peer.
 * `Node.background` dials `store.recent_peers(DIAL_ON_START=64, exclude_blocked=True)` instead of every peer.
@@ -168,7 +169,7 @@ usernames. Blocking lives in its own table, so pruning never unblocks anyone.
 Pruning runs when `start` launches the daemon, and again from `remember_peer` at most once an hour (`PRUNE_EVERY`),
 so a long-running daemon stays bounded without changes to `Node`'s maintenance loops. On startup the daemon dials
 only the 64 most recently seen peers; the rest are still known and can be found through `find`. All four limits are
-class or module constants and should be tuned once the mesh-discovery work shows real peer counts.
+class or module constants and should be tuned against real peer counts from mesh discovery.
 
 ## 6. Migrating the JSON files on first run
 
@@ -222,19 +223,17 @@ Properties covered by the tests in `tests/test_migration.py`:
    and bounded peer-exchange replies are O(log n) instead of rewriting or re-parsing whole files. `read` and
    `read -f` stop re-parsing the whole history (from 187 ms to under 0.1 ms at 100k messages).
 3. The cost is low. It uses only the standard library, with no new dependency (`requirements.txt` is unchanged).
-   Async use needs only a small `AsyncStore` wrapper around `trio.to_thread`. The `Store` interface is preserved, and the `Node` diff is seven one-to-three
-   line hunks.
+   Async use needs only a small `AsyncStore` wrapper around `trio.to_thread`. The `Store` interface is mostly
+   preserved, and the `Node` changes are a handful of small call-site edits.
 4. You can still inspect the data with `sqlite3 store.db`, and the schema is versioned for future changes.
 
 **Changes to make before merging to `main`:**
 
-1. **Tune `DIAL_ON_START`, `PEX_LIMIT`, `MAX_PEERS` and `PEER_TTL`** against real numbers once the mesh-discovery
-   work has landed. That work decides how many peers a node actually meets.
-2. **Merge order.** Land the mesh-discovery work first, then rebase this branch onto it. The only `Node` hunks that
-   could conflict are in `handle` (the `peers` reply), `find`, `background` and `command`.
-3. **Regenerate `scripture.py`** with `make_scripture.py` when merging, if it is meant to track `gnosis_mesh.py`.
+1. **Tune `DIAL_ON_START`, `PEX_LIMIT`, `MAX_PEERS` and `PEER_TTL`** against real peer counts from mesh
+   discovery, which decides how many peers a node actually meets. (The branch is already rebased onto it.)
+2. **Regenerate `scripture.py`** with `make_scripture.py` when merging, if it is meant to track `gnosis_mesh.py`.
    The experiment branch leaves it alone.
-4. Optional: add a `gnosis_mesh.py export` command that writes the old JSON or JSONL files, for anyone who wants
+3. Optional: add a `gnosis_mesh.py export` command that writes the old JSON or JSONL files, for anyone who wants
    plain-text history or a downgrade path.
 
 **Why not "don't adopt":** the main alternative is to patch the JSON store. That means unique temporary names plus
@@ -243,7 +242,7 @@ database by hand and still rewrite the whole peers file on every request.
 
 ## Tests
 
-`.venv/bin/python -m pytest` runs 29 tests in about 2 seconds:
+`.venv/bin/python -m pytest` runs 37 tests in about 5 seconds:
 
 * `tests/test_store.py`: round-trips for config, nicknames, blocks, peers (`UPSERT` semantics and ordering),
   pruning (age, cap, exemptions, hourly trigger), messages (filters, `last`, `after`, blocked), `label`/`resolve`,
@@ -254,6 +253,12 @@ database by hand and still rewrite the whole peers file on every request.
 * `tests/test_concurrency.py`: two processes writing peers (including the same rows), messages, blocks and
   nicknames at once with no lost updates, and a `read -f` style cursor seeing every message from another process
   exactly once.
+* `tests/test_async.py`: `AsyncStore` with 20 concurrent trio tasks (nothing lost, per-task order kept), a write
+  lock held by another process without stalling the event loop (with an inline control), and cancellation while a
+  write is blocked.
+* `tests/test_node.py`: `Node` logic with stand-ins for the host and streams. It covers peer-exchange intake caps,
+  `announce_loop` surviving errors, retried messages stored once, failed requests resetting their stream, blocked
+  peers losing relay reservations, and malformed control requests.
 * `tests/test_cli.py`: `username`/`nick`/`block`/`unblock`/`blocked`/`read`/`peers` against a temporary `--home`,
   plus the CLI migrating a legacy home.
 
