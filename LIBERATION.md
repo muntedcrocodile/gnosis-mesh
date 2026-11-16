@@ -237,6 +237,8 @@ forks in heaven.
 
 ```python
 from __future__ import annotations
+import collections
+import contextlib
 import hashlib
 import ipaddress
 import json
@@ -245,6 +247,7 @@ import os
 import queue
 import random
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -264,11 +267,11 @@ from libp2p.discovery.events.peerDiscovery import peerDiscovery
 from libp2p.host.autonat import AutoNATService, AutoNATStatus
 from libp2p.host.autonat.autonat import AUTONAT_PROTOCOL_ID
 from libp2p.identity.identify_push.identify_push import push_identify_to_peers
-from libp2p.kad_dht.kad_dht import DHTMode, KadDHT
+from libp2p.kad_dht.kad_dht import DHTMode, KadDHT, _encode_key
 from libp2p.network.stream.exceptions import StreamEOF
 from libp2p.peer.id import ID
 from libp2p.peer.peerinfo import PeerInfo, info_from_p2p_addr
-from libp2p.peer.peerstore import PERMANENT_ADDR_TTL
+from libp2p.peer.peerstore import PERMANENT_ADDR_TTL, PeerStore
 from libp2p.relay.circuit_v2.config import RelayConfig, RelayRole
 from libp2p.relay.circuit_v2.dcutr import DCUtRProtocol
 from libp2p.relay.circuit_v2.protocol import PROTOCOL_ID as HOP_PROTOCOL_ID
@@ -284,63 +287,130 @@ from multiaddr.protocols import P_P2P
 PROTO = TProtocol('/gnosis-mesh/1.0.0')
 MAX_MSG = 1 << 20
 RELAY_TARGET = 3
+MESH_TARGET = 8
+DIAL_ON_START = 64
+MAX_NAME = 64
+MAX_ADDRS = 16
+MAX_TEXT = 16 << 10
+PEX_LIMIT = 200
 IPFS_BOOTSTRAP = ['/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN', '/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa', '/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb', '/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt', '/dnsaddr/va1.bootstrap.libp2p.io/p2p/12D3KooWKnDdG3iXw9eTFijk3EWSunZcFi54Zka4wmtqtt6rPxc8', '/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ', '/ip4/104.131.131.82/udp/4001/quic-v1/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ']
 Json = dict[str, Any]
 log = logging.getLogger('gnosis-mesh')
+SCHEMA = "\n-- settings values are JSON, e.g. username\nCREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;\nCREATE TABLE IF NOT EXISTS nicks (pid TEXT PRIMARY KEY, nick TEXT NOT NULL) WITHOUT ROWID;\nCREATE INDEX IF NOT EXISTS nicks_nick ON nicks (nick);\nCREATE TABLE IF NOT EXISTS blocked (pid TEXT PRIMARY KEY) WITHOUT ROWID;\nCREATE TABLE IF NOT EXISTS peers (pid TEXT NOT NULL UNIQUE, name TEXT, addrs TEXT NOT NULL DEFAULT '[]', seen REAL NOT NULL);\nCREATE INDEX IF NOT EXISTS peers_seen ON peers (seen);\nCREATE INDEX IF NOT EXISTS peers_name ON peers (name);\nCREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, peer TEXT NOT NULL,\n                                     dir TEXT NOT NULL CHECK (dir IN ('in', 'out')), text TEXT NOT NULL);\nCREATE INDEX IF NOT EXISTS messages_peer ON messages (peer, id);\n"
 class Store:
+    PEER_TTL = 30 * 86400
+    MAX_PEERS = 2000
+    PRUNE_EVERY = 3600
     def __init__(self, home: Path) -> None:
         self.home = home
-        home.mkdir(parents=True, exist_ok=True)
+        home.mkdir(parents=True, exist_ok=True, mode=448)
         name = f'gnosis-mesh-{hashlib.sha1(str(home.resolve()).encode()).hexdigest()[:12]}.sock'
-        for run_dir in (os.environ.get('XDG_RUNTIME_DIR'), tempfile.gettempdir(), '/tmp'):
+        for run_dir in (str(home.resolve()), os.environ.get('XDG_RUNTIME_DIR'), tempfile.gettempdir(), '/tmp'):
             self.sock = os.path.join(run_dir or '/tmp', name)
             if len(self.sock.encode()) < 104:
                 break
-    def _load(self, name: str) -> Json:
-        p = self.home / name
-        return json.loads(p.read_text()) if p.exists() else {}
-    def _save(self, name: str, data: Json) -> None:
-        tmp = self.home / f'.{name}.tmp'
-        tmp.write_text(json.dumps(data, indent=2))
-        tmp.replace(self.home / name)
+        self.db_path = home / 'store.db'
+        if not self.db_path.exists():
+            os.close(os.open(self.db_path, os.O_WRONLY | os.O_CREAT, 384))
+        self.db = sqlite3.connect(self.db_path, isolation_level=None, timeout=5)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute('PRAGMA journal_mode=WAL')
+        self.db.execute('PRAGMA synchronous=NORMAL')
+        self._last_prune = time.time()
+        self.db.executescript(SCHEMA)
+    def close(self) -> None:
+        self.db.close()
     def config(self) -> Json:
-        return {'username': '', 'nicks': {}, 'blocked': [], **self._load('config.json')}
+        cfg: Json = {'username': '', **{r[0]: json.loads(r[1]) for r in self.db.execute('SELECT * FROM settings')}}
+        cfg['nicks'] = dict(self.db.execute('SELECT pid, nick FROM nicks').fetchall())
+        cfg['blocked'] = [r[0] for r in self.db.execute('SELECT pid FROM blocked ORDER BY pid')]
+        return cfg
     def set_config(self, **kw: Any) -> None:
-        self._save('config.json', {**self.config(), **kw})
+        self.db.executemany('INSERT OR REPLACE INTO settings VALUES (?, ?)', ((k, json.dumps(v)) for k, v in kw.items()))
+    def username(self) -> str:
+        row = self.db.execute("SELECT value FROM settings WHERE key = 'username'").fetchone()
+        return json.loads(row[0]) if row else ''
+    def set_nick(self, pid: str, nick: str | None) -> None:
+        if nick:
+            self.db.execute('INSERT OR REPLACE INTO nicks VALUES (?, ?)', (pid, nick))
+        else:
+            self.db.execute('DELETE FROM nicks WHERE pid = ?', (pid,))
+    def is_blocked(self, pid: str) -> bool:
+        return self.db.execute('SELECT 1 FROM blocked WHERE pid = ?', (pid,)).fetchone() is not None
+    def block(self, pid: str) -> None:
+        self.db.execute('INSERT OR IGNORE INTO blocked VALUES (?)', (pid,))
+    def unblock(self, pid: str) -> None:
+        self.db.execute('DELETE FROM blocked WHERE pid = ?', (pid,))
+    @staticmethod
+    def _peer(row: sqlite3.Row) -> Json:
+        entry: Json = {'addrs': json.loads(row['addrs']), 'seen': row['seen']}
+        if row['name'] is not None:
+            entry['name'] = row['name']
+        return entry
     def peers(self) -> Json:
-        return self._load('peers.json')
-    def save_peers(self, peers: Json) -> None:
-        self._save('peers.json', peers)
+        return {r['pid']: self._peer(r) for r in self.db.execute('SELECT * FROM peers ORDER BY rowid')}
+    def recent_peers(self, limit: int) -> Json:
+        rows = self.db.execute('SELECT * FROM peers WHERE pid NOT IN (SELECT pid FROM blocked) ORDER BY seen DESC LIMIT ?', (limit,))
+        return {r['pid']: self._peer(r) for r in rows}
+    def has_peer(self, pid: str) -> bool:
+        return self.db.execute('SELECT 1 FROM peers WHERE pid = ?', (pid,)).fetchone() is not None
+    def remember_peer(self, pid: str, addrs: list[str], name: str | None, seen: float | None=None) -> None:
+        self.db.execute("INSERT INTO peers (pid, name, addrs, seen) VALUES (?, ?, ?, ?) ON CONFLICT (pid) DO UPDATE SET name = coalesce(excluded.name, name), addrs = CASE excluded.addrs WHEN '[]' THEN addrs ELSE excluded.addrs END, seen = excluded.seen", (pid, name or None, json.dumps(addrs), time.time() if seen is None else seen))
+        if time.time() - self._last_prune > self.PRUNE_EVERY:
+            self.prune_peers()
+    def prune_peers(self, ttl: float | None=None, keep: int | None=None) -> int:
+        ttl, keep = (self.PEER_TTL if ttl is None else ttl, self.MAX_PEERS if keep is None else keep)
+        kept = 'pid NOT IN (SELECT pid FROM nicks) AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.peer = pid)'
+        self._last_prune = time.time()
+        n = self.db.execute(f'DELETE FROM peers WHERE seen < ? AND {kept}', (time.time() - ttl,)).rowcount
+        n += self.db.execute(f'DELETE FROM peers WHERE {kept} AND rowid NOT IN (SELECT rowid FROM peers ORDER BY seen DESC LIMIT ?)', (keep,)).rowcount
+        if n:
+            log.info('pruned %d stale peers', n)
+        return n
     def key_seed(self) -> bytes:
         p = self.home / 'key'
         if not p.exists():
-            p.write_bytes(os.urandom(32))
-            p.chmod(384)
+            tmp = self.home / f'.key-{os.getpid()}'
+            with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 384), 'wb') as f:
+                f.write(os.urandom(32))
+            with contextlib.suppress(FileExistsError):
+                os.link(tmp, p)
+            tmp.unlink()
         return p.read_bytes()
     def log_message(self, peer: str, direction: str, text: str) -> None:
-        with open(self.home / 'messages.jsonl', 'a') as f:
-            f.write(json.dumps({'ts': time.time(), 'peer': peer, 'dir': direction, 'text': text}) + '\n')
-    def messages(self) -> list[Json]:
-        p = self.home / 'messages.jsonl'
-        return [json.loads(line) for line in p.read_text().splitlines() if line] if p.exists() else []
+        self.db.execute('INSERT INTO messages (ts, peer, dir, text) VALUES (?, ?, ?, ?)', (time.time(), peer, direction, text))
+    def last_message_id(self) -> int:
+        return self.db.execute('SELECT coalesce(max(id), 0) FROM messages').fetchone()[0]
+    def messages(self, peer: str | None=None, last: int | None=None, after: int=0, include_blocked: bool=True) -> list[Json]:
+        where, args = (['id > ?'], [after])
+        if peer is not None:
+            where.append('peer = ?')
+            args.append(peer)
+        if not include_blocked:
+            where.append('peer NOT IN (SELECT pid FROM blocked)')
+        sql = f"SELECT * FROM messages WHERE {' AND '.join(where)} ORDER BY id"
+        if last:
+            sql = f'SELECT * FROM ({sql} DESC LIMIT ?) ORDER BY id'
+            args.append(last)
+        return [dict(r) for r in self.db.execute(sql, args)]
     def label(self, pid: str) -> str:
-        nick = self.config()['nicks'].get(pid)
-        name = self.peers().get(pid, {}).get('name')
-        return nick or name or f'{pid[:6]}…{pid[-6:]}'
+        nick = self.db.execute('SELECT nick FROM nicks WHERE pid = ?', (pid,)).fetchone()
+        name = self.db.execute('SELECT name FROM peers WHERE pid = ?', (pid,)).fetchone()
+        return nick and nick[0] or (name and name[0]) or f'{pid[:6]}…{pid[-6:]}'
     def resolve(self, who: str) -> str:
-        for pid, nick in self.config()['nicks'].items():
-            if nick == who:
-                return pid
-        named = [pid for pid, p in self.peers().items() if p.get('name') == who]
-        if len(named) > 1:
-            raise click.ClickException(f"username '{who}' is ambiguous ({', '.join(named)}); use a peer ID or nickname")
-        if named:
-            return named[0]
+        if (nicked := self.db.execute('SELECT pid FROM nicks WHERE nick = ? LIMIT 1', (who,)).fetchone()):
+            return nicked[0]
         try:
             multihash.decode(ID.from_base58(who).to_bytes())
             return who
         except Exception:
-            raise click.ClickException(f"'{who}' is not a known nickname, username or valid peer ID")
+            pass
+        named = [r[0] for r in self.db.execute('SELECT pid FROM peers WHERE name = ? ORDER BY rowid', (who,))]
+        if len(named) > 1:
+            raise click.ClickException(f"username '{who}' is ambiguous ({', '.join(named)}); use a peer ID or nickname")
+        if named:
+            return named[0]
+        raise click.ClickException(f"'{who}' is not a known nickname, username or valid peer ID")
 async def read_all(stream: INetStream) -> bytes:
     buf = b''
     try:
@@ -351,6 +421,8 @@ async def read_all(stream: INetStream) -> bytes:
     except StreamEOF:
         pass
     return buf
+def clean(s: str) -> str:
+    return ''.join((c if c.isprintable() else ' ' for c in s))
 def is_circuit(addr: Multiaddr) -> bool:
     return '/p2p-circuit' in str(addr)
 def addr_rank(addr: Multiaddr) -> int:
@@ -374,27 +446,30 @@ def addr_order(addr: Multiaddr) -> tuple[bool, bool, int, bool]:
     return (rank == 3, s.startswith('/ip6/'), rank, '/quic' in s)
 def rendezvous_key(pid: str) -> str:
     return '1220' + hashlib.sha256(f'gnosis-mesh:{pid}'.encode()).hexdigest()
+MESH_KEY = '1220' + hashlib.sha256(b'gnosis-mesh:/mesh/1').hexdigest()
 class Node:
     def __init__(self, store: Store, port: int, bootstrap: list[str], echo: bool, mdns: bool, public: bool) -> None:
         self.store, self.bootstrap, self.echo, self.public = (store, bootstrap, echo, public)
         fams = ['/ip4/0.0.0.0'] + (['/ip6/::'] if is_ipv6_available() else [])
         self.listen = [Multiaddr(f'{f}/{t}') for f in fams for t in (f'tcp/{port}', f'udp/{port}/quic-v1')]
         self.keys = create_new_key_pair(store.key_seed())
-        self.host: IHost = new_host(key_pair=self.keys, listen_addrs=self.listen, enable_quic=True, sec_opt={NOISE_PROTOCOL_ID: NoiseTransport(self.keys, noise_privkey=create_x25519_key_pair().private_key)}, enable_mDNS=mdns, enable_upnp=public, bootstrap=bootstrap + (IPFS_BOOTSTRAP if public else []) or None, bootstrap_allow_ipv6=True, addrs_factory=lambda addrs: [x for a in addrs for x in expand(a)])
+        self.host: IHost = new_host(key_pair=self.keys, listen_addrs=self.listen, enable_quic=True, sec_opt={NOISE_PROTOCOL_ID: NoiseTransport(self.keys, noise_privkey=create_x25519_key_pair().private_key)}, enable_mDNS=mdns, enable_upnp=public, bootstrap=bootstrap + (IPFS_BOOTSTRAP if public else []) or None, bootstrap_allow_ipv6=True, addrs_factory=lambda addrs: [x for a in addrs for x in expand(a)], peerstore_opt=PeerStore(max_peers=20000))
         self.direct_addrs = self.host.get_addrs
         self.host.get_addrs = self.advertised
         self.host.get_public_key = lambda: self.keys.public_key
         self.host.get_private_key = lambda: self.keys.private_key
         self.dht = KadDHT(self.host, DHTMode.CLIENT if public else DHTMode.SERVER, enable_random_walk=True)
         self.circuit = CircuitV2Protocol(self.host, RelayLimits(duration=3600, data=16 << 20, max_circuit_conns=64, max_reservations=64), allow_hop=True)
-        self.relay_hop = self.circuit._handle_hop_stream
-        self.circuit._handle_hop_stream = self.hop_acl
+        self.lib_reserve, self.lib_connect = (self.circuit._handle_reserve, self.circuit._handle_connect)
+        self.circuit._handle_reserve = self.relay_reserve
+        self.circuit._handle_connect = self.relay_connect
         self.relay = CircuitV2Transport(self.host, self.circuit, RelayConfig(roles=RelayRole.STOP | RelayRole.CLIENT))
         self.relay.discovery.auto_reserve = False
         self.dcutr = DCUtRProtocol(self.host)
         self.autonat = AutoNATService(self.host)
         self.reachability = AutoNATStatus.UNKNOWN
         self.greeted: set[ID] = set()
+        self.recent_ids: collections.deque[tuple[ID, str]] = collections.deque(maxlen=1000)
         self.dial_errors: list[str] = []
         self.upnp_ports: list[tuple[str, str]] = []
         self.last_addrs: set[str] = set()
@@ -427,13 +502,16 @@ class Node:
         return addrs
     def learn(self, pid: ID, addrs: list[str]) -> None:
         ma = []
-        for a in addrs:
+        for a in (addrs if isinstance(addrs, list) else [])[:MAX_ADDRS]:
             try:
                 ma.append(Multiaddr(a))
             except Exception:
                 pass
         if ma and pid != self.host.get_id():
-            self.host.get_peerstore().add_addrs(pid, ma, PERMANENT_ADDR_TTL)
+            ps = self.host.get_peerstore()
+            old = [a for a in self.addrs(pid) if a not in ma]
+            ps.clear_addrs(pid)
+            ps.add_addrs(pid, (ma + old)[:MAX_ADDRS], PERMANENT_ADDR_TTL)
     def speaks(self, pid: ID, proto: str) -> bool:
         try:
             return bool(self.host.get_peerstore().supports_protocols(pid, [proto]))
@@ -442,8 +520,7 @@ class Node:
     def connected(self, pid: ID) -> bool:
         return pid in self.host.get_connected_peers()
     def link(self, pid: ID) -> str:
-        conns: Any = getattr(self.host.get_network(), 'connections', {}).get(pid, [])
-        for c in conns if isinstance(conns, list) else [conns]:
+        for c in self.host.get_network().connections.get(pid, []):
             try:
                 if not any((is_circuit(a) for a in c.get_transport_addresses())):
                     return 'direct'
@@ -451,55 +528,68 @@ class Node:
                 return 'direct'
         return 'relayed'
     def blocked(self, pid: str) -> bool:
-        return pid in self.store.config()['blocked']
+        return self.store.is_blocked(pid)
     def remember(self, pid: ID, name: str | None) -> None:
-        peers = self.store.peers()
-        entry = peers.setdefault(pid.to_base58(), {})
-        addrs = [str(a) for a in self.addrs(pid)]
-        entry.update(addrs=addrs or entry.get('addrs', []), seen=time.time())
-        if name:
-            entry['name'] = name
-        self.store.save_peers(peers)
+        name = clean(name)[:MAX_NAME] if isinstance(name, str) else None
+        self.store.remember_peer(pid.to_base58(), [str(a) for a in self.addrs(pid)][:MAX_ADDRS], name)
     async def handle(self, stream: INetStream) -> None:
         pid = stream.muxed_conn.peer_id
         if self.blocked(pid.to_base58()):
             await stream.reset()
             return
         try:
-            req = json.loads(await read_all(stream))
-            self.remember(pid, req.get('name'))
-            reply: Json = {'name': self.store.config()['username']}
-            if req['t'] == 'msg':
-                self.store.log_message(pid.to_base58(), 'in', req['text'])
-                if self.echo:
-                    click.echo(f"\n[{self.store.label(pid.to_base58())}] {req['text']}")
-            elif req['t'] == 'peers':
-                reply['peers'] = [{'id': k, **v} for k, v in self.store.peers().items() if k != pid.to_base58() and (not self.blocked(k))]
-            await stream.write(json.dumps(reply).encode())
-            await stream.close()
-            self.greeted.add(pid)
+            with trio.fail_after(30):
+                req = json.loads(await read_all(stream))
+                if self.blocked(pid.to_base58()):
+                    raise PermissionError('blocked')
+                reply: Json = {'name': self.store.username()}
+                if req['t'] == 'msg':
+                    text = clean(req['text'])
+                    if len(text) > MAX_TEXT:
+                        raise ValueError('message too long')
+                    mid = req.get('id')
+                    key = (pid, mid) if isinstance(mid, str) and len(mid) <= 64 else None
+                    if key is None or key not in self.recent_ids:
+                        self.store.log_message(pid.to_base58(), 'in', text)
+                        if key:
+                            self.recent_ids.append(key)
+                        if self.echo:
+                            click.echo(f'\n[{self.store.label(pid.to_base58())}] {text}')
+                elif req['t'] == 'peers':
+                    reply['peers'] = [{'id': k, **v} for k, v in self.store.recent_peers(PEX_LIMIT).items() if k != pid.to_base58()]
+                self.remember(pid, req.get('name'))
+                await stream.write(json.dumps(reply).encode())
+                await stream.close()
+                self.greeted.add(pid)
         except Exception as e:
             log.debug('bad request from %s: %s', pid, e)
             await stream.reset()
     async def request(self, pid: ID, t: str, **body: Any) -> Json:
         with trio.fail_after(30):
             stream = await self.host.new_stream(pid, [PROTO])
-            await stream.write(json.dumps({'t': t, 'name': self.store.config()['username'], **body}).encode())
-            await stream.close_write()
-            reply = json.loads(await read_all(stream))
-            await stream.close()
-        self.remember(pid, reply.get('name'))
-        for p in reply.get('peers', []):
             try:
-                self.learn(ID.from_base58(p['id']), p.get('addrs', []))
-            except Exception:
-                pass
+                await stream.write(json.dumps({'t': t, 'name': self.store.username(), **body}).encode())
+                await stream.close_write()
+                reply = json.loads(await read_all(stream))
+                await stream.close()
+            except BaseException:
+                with trio.move_on_after(1, shield=True):
+                    await stream.reset()
+                raise
+        self.remember(pid, reply.get('name'))
+        reply['peers'] = reply['peers'][:PEX_LIMIT] if isinstance(reply.get('peers'), list) else []
         return reply
-    async def greet(self, pid: ID, t: str='hello') -> None:
+    async def exchange(self, other: ID) -> dict[ID, Any]:
+        offered: dict[ID, Any] = {}
+        with contextlib.suppress(Exception):
+            for p in (await self.request(other, 'peers'))['peers']:
+                offered[ID.from_base58(p['id'])] = p.get('addrs', [])
+        return offered
+    async def greet(self, pid: ID) -> None:
         try:
-            await self.request(pid, t)
+            await self.request(pid, 'hello')
         except Exception as e:
-            log.debug('%s to %s failed: %s', t, pid, e)
+            log.debug('hello to %s failed: %s', pid, e)
     async def race(self, addrs: list[Multiaddr], dial: Callable[[Multiaddr], Awaitable[Any]]) -> bool:
         ok = False
         async with trio.open_nursery() as n:
@@ -526,8 +616,7 @@ class Node:
         direct = sorted((a for a in addrs if not is_circuit(a)), key=addr_rank)
         relayed = [a if str(a).endswith(f'/p2p/{pid}') else Multiaddr(f'{a}/p2p/{pid}') for a in addrs if is_circuit(a)]
         net: Any = self.host.get_network()
-        if hasattr(net, 'unblock_peer'):
-            net.unblock_peer(pid)
+        net.unblock_peer(pid)
         shared = [Multiaddr(f'/p2p/{p}/p2p-circuit/p2p/{pid}') for p in self.chat_relays() if p != pid]
         ok, began = (False, trio.current_time())
         self.dial_errors = []
@@ -563,10 +652,13 @@ class Node:
     async def find(self, pid: ID) -> bool:
         if await self.try_connect(pid):
             return True
+        async def ask(other: ID) -> None:
+            if pid in (offered := (await self.exchange(other))):
+                self.learn(pid, offered[pid])
         async with trio.open_nursery() as n:
             for other in self.host.get_connected_peers():
-                if other.to_base58() in self.store.peers():
-                    n.start_soon(self.greet, other, 'peers')
+                if self.store.has_peer(other.to_base58()):
+                    n.start_soon(ask, other)
         if await self.try_connect(pid):
             return True
         found = False
@@ -598,19 +690,65 @@ class Node:
             return False
         with trio.move_on_after(120):
             closest = await self.dht.peer_routing.find_closest_peers_network(self.host.get_id().to_bytes())
-            provided = bool(await self.dht.provide(rendezvous_key(self.me)))
-            log.info('announced: %d closest peers, provider record stored=%s', len(closest), provided)
+            provided = bool(await self.dht.provide(rendezvous_key(self.me))) and bool(await self.dht.provide(MESH_KEY))
+            log.info('announced: %d closest peers, provider records stored=%s', len(closest), provided)
             return provided
         log.info('announce timed out')
         return False
+    async def find_mesh_peers(self) -> list[PeerInfo]:
+        key, store = (_encode_key(MESH_KEY), self.dht.provider_store)
+        found = {i.peer_id: i for i in store.get_providers(key)}
+        async with trio.open_nursery() as n:
+            async def ask(peer: ID) -> None:
+                with trio.move_on_after(15):
+                    try:
+                        providers, _ = await store._get_providers_from_peer_with_closers(peer, key)
+                        found.update(((i.peer_id, i) for i in providers))
+                    except Exception as e:
+                        log.debug('mesh provider query to %s failed: %s', peer, e)
+            for peer in await self.dht.peer_routing.find_closest_peers_network(key):
+                n.start_soon(ask, peer)
+        found.pop(self.host.get_id(), None)
+        return list(found.values())
+    async def discover(self) -> bool:
+        have = self.chat_peers()
+        if len(have) >= MESH_TARGET:
+            return True
+        if self.dht.get_routing_table_size() == 0 and (not have):
+            return False
+        offered: dict[ID, Any] = {}
+        async with trio.open_nursery() as n:
+            async def from_dht() -> None:
+                with trio.move_on_after(60), contextlib.suppress(Exception):
+                    for info in await self.find_mesh_peers():
+                        offered[info.peer_id] = [str(a) for a in info.addrs]
+            async def from_peer(pid: ID) -> None:
+                offered.update(await self.exchange(pid))
+            n.start_soon(from_dht)
+            for pid in have:
+                n.start_soon(from_peer, pid)
+        fresh = [p for p in offered if p != self.host.get_id() and p not in have and (not self.connected(p)) and (not self.blocked(p.to_base58()))]
+        random.shuffle(fresh)
+        batch = fresh[:2 * (MESH_TARGET - len(have))]
+        async with trio.open_nursery() as n:
+            for pid in batch:
+                self.learn(pid, offered[pid])
+                n.start_soon(self.try_connect, pid)
+        log.info('discovery: %d chat peers connected (was %d), %d candidates, dialled %d', len(self.chat_peers()), len(have), len(fresh), len(batch))
+        return True
+    def chat_peers(self) -> list[ID]:
+        return [p for p in self.host.get_connected_peers() if self.speaks(p, PROTO) and (not self.blocked(p.to_base58()))]
     def chat_relays(self) -> list[ID]:
-        return [p for p in self.host.get_connected_peers() if self.speaks(p, PROTO) and self.speaks(p, HOP_PROTOCOL_ID) and (not self.blocked(p.to_base58()))]
-    async def hop_acl(self, stream: INetStream) -> None:
-        pid = stream.muxed_conn.peer_id
-        if self.speaks(pid, PROTO) and (not self.blocked(pid.to_base58())):
-            await self.relay_hop(stream)
-        else:
-            await stream.reset()
+        return [p for p in self.chat_peers() if self.speaks(p, HOP_PROTOCOL_ID)]
+    def relay_allowed(self, pid: ID) -> bool:
+        return self.speaks(pid, PROTO) and (not self.blocked(pid.to_base58()))
+    async def relay_reserve(self, stream: INetStream, msg: Any) -> None:
+        src = stream.muxed_conn.peer_id
+        ok = self.relay_allowed(src) and (not msg.peer.id or msg.peer.id == src.to_bytes())
+        await (self.lib_reserve(stream, msg) if ok else stream.reset())
+    async def relay_connect(self, stream: INetStream, msg: Any) -> None:
+        ok = self.relay_allowed(stream.muxed_conn.peer_id) and (not self.blocked(ID(msg.peer.id).to_base58()))
+        await (self.lib_connect(stream, msg) if ok else stream.reset())
     async def reserve(self, relay: ID) -> None:
         d = self.relay.discovery
         with trio.move_on_after(20):
@@ -667,10 +805,15 @@ class Node:
         return True
     async def announce_loop(self) -> None:
         while True:
-            if not await self.announce():
+            self.reannounce = trio.Event()
+            try:
+                announced = await self.announce()
+            except Exception as e:
+                log.info('announce failed: %s', e)
+                announced = False
+            if not announced:
                 await trio.sleep(15)
                 continue
-            self.reannounce = trio.Event()
             with trio.move_on_after(600):
                 await self.reannounce.wait()
     async def maintain(self) -> None:
@@ -679,6 +822,7 @@ class Node:
             n.start_soon(self.every, 15, self.keep_relays)
             n.start_soon(self.every, 5, self.watch_addrs)
             n.start_soon(self.announce_loop)
+            n.start_soon(self.every, 60, self.discover)
     async def background(self) -> None:
         async with trio.open_nursery() as n:
             for addr in self.bootstrap:
@@ -688,10 +832,9 @@ class Node:
                     continue
                 self.learn(info.peer_id, [str(a) for a in info.addrs])
                 n.start_soon(self.try_connect, info.peer_id)
-            for known, p in self.store.peers().items():
-                if not self.blocked(known):
-                    self.learn(ID.from_base58(known), p.get('addrs', []))
-                    n.start_soon(self.try_connect, ID.from_base58(known))
+            for known, p in self.store.recent_peers(DIAL_ON_START).items():
+                self.learn(ID.from_base58(known), p.get('addrs', []))
+                n.start_soon(self.try_connect, ID.from_base58(known))
             n.start_soon(self.maintain)
             seen: set[ID] = set()
             while True:
@@ -709,36 +852,36 @@ class Node:
                         n.start_soon(self.greet, pid)
                 await trio.sleep(2)
     async def control(self, conn: trio.SocketStream, stop: trio.CancelScope) -> None:
-        req: Json = {}
         try:
             buf = b''
             while (chunk := (await conn.receive_some(65536))):
                 buf += chunk
             req = json.loads(buf)
             try:
-                reply = await self.command(req)
+                with trio.fail_after(80):
+                    reply = await self.command(req)
             except Exception as e:
                 reply = {'error': str(e) or type(e).__name__}
             await conn.send_all(json.dumps(reply).encode() + b'\n')
-            await conn.aclose()
+            if req.get('cmd') == 'stop':
+                stop.cancel()
         except Exception as e:
             log.debug('control connection failed: %s', e)
-        if req.get('cmd') == 'stop':
-            stop.cancel()
     async def command(self, req: Json) -> Json:
         if req['cmd'] == 'status':
             conns = self.host.get_connected_peers()
-            return {'id': self.me, 'addrs': [str(a) for a in self.host.get_addrs()], 'reachability': {AutoNATStatus.PUBLIC: 'public', AutoNATStatus.PRIVATE: 'behind NAT'}.get(self.reachability, 'unknown'), 'dht': f'{self.dht.mode.value}, {self.dht.get_routing_table_size()} peers in routing table', 'relays': [p.to_base58() for p in self.reserved_relays()], 'connections': len(conns), 'connected': [[p.to_base58(), self.link(p)] for p in conns if p.to_base58() in self.store.peers()]}
+            return {'id': self.me, 'addrs': [str(a) for a in self.host.get_addrs()], 'reachability': {AutoNATStatus.PUBLIC: 'public', AutoNATStatus.PRIVATE: 'behind NAT'}.get(self.reachability, 'unknown'), 'dht': f'{self.dht.mode.value}, {self.dht.get_routing_table_size()} peers in routing table', 'relays': [p.to_base58() for p in self.reserved_relays()], 'connections': len(conns), 'connected': [[p.to_base58(), self.link(p)] for p in conns if self.store.has_peer(p.to_base58())]}
         if req['cmd'] == 'stop':
             return {}
         pid = ID.from_base58(req['peer'])
         error = 'not found'
+        mid = os.urandom(8).hex()
         for attempt in range(3):
             if not await self.find(pid):
                 return {'error': f"could not reach {req['peer']}"}
             try:
                 if req['cmd'] == 'send':
-                    await self.request(pid, 'msg', text=req['text'])
+                    await self.request(pid, 'msg', text=req['text'], id=mid)
                     self.store.log_message(req['peer'], 'out', req['text'])
                     return {}
                 if req['cmd'] == 'peers':
@@ -784,9 +927,9 @@ class Node:
                 os.unlink(self.store.sock)
             sock = trio.socket.socket(trio.socket.AF_UNIX)
             await sock.bind(self.store.sock)
+            os.chmod(self.store.sock, 384)
             sock.listen()
             n.start_soon(trio.serve_listeners, lambda c: self.control(c, n.cancel_scope), [trio.SocketListener(sock)])
-        os.unlink(self.store.sock)
 def daemon_call(store: Store, timeout: float=90, **req: Any) -> Json:
     try:
         with socket.socket(socket.AF_UNIX) as s:
@@ -834,7 +977,7 @@ def start(store: Store, port: int, bootstrap: tuple[str, ...], detach: bool, no_
         args = [sys.executable, __file__, '--home', str(store.home), 'start', '-p', str(port)]
         args += [x for b in bootstrap for x in ('-b', b)] + ['-v'] * verbose
         args += (['--no-mdns'] if no_mdns else []) + (['--private'] if private else [])
-        with open(store.home / 'daemon.log', 'a') as logfile:
+        with open(os.open(store.home / 'daemon.log', os.O_WRONLY | os.O_CREAT | os.O_APPEND, 384), 'a') as logfile:
             subprocess.Popen(args, stdout=logfile, stderr=logfile, stdin=subprocess.DEVNULL, start_new_session=True)
         for _ in range(300):
             time.sleep(0.2)
@@ -846,6 +989,7 @@ def start(store: Store, port: int, bootstrap: tuple[str, ...], detach: bool, no_
     logging.basicConfig(level=level, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
     logging.getLogger('libp2p').setLevel(level if verbose > 1 else logging.CRITICAL)
     logging.getLogger('libp2p').propagate = verbose > 1
+    store.prune_peers()
     while True:
         node = Node(store, port, list(bootstrap), echo=True, mdns=not no_mdns, public=not private)
         try:
@@ -854,7 +998,7 @@ def start(store: Store, port: int, bootstrap: tuple[str, ...], detach: bool, no_
         except KeyboardInterrupt:
             return
         except BaseException as e:
-            log.error('node crashed (%s: %s); restarting in 5s', type(e).__name__, e)
+            log.critical('node crashed (%s: %s); restarting in 5s', type(e).__name__, e)
             time.sleep(5)
         finally:
             peerDiscovery.unregister_peer_discovered_handler(node.found.put)
@@ -867,9 +1011,9 @@ def stop(store: Store) -> None:
 @click.pass_obj
 def status(store: Store) -> None:
     r = daemon_call(store, cmd='status')
-    click.echo(f"peer id:      {r['id']}\nusername:     {store.config()['username'] or '-'}\nreachability: {r['reachability']}\ndht:          {r['dht']}\nconnections:  {r['connections']}")
+    click.echo(f"peer id:      {r['id']}\nusername:     {store.username() or '-'}\nreachability: {r['reachability']}\ndht:          {r['dht']}\nconnections:  {r['connections']}")
     for p in r['relays']:
-        click.echo(f'relay:        {(store.label(p) if p in store.peers() else p)}')
+        click.echo(f'relay:        {(store.label(p) if store.has_peer(p) else p)}')
     for a in r['addrs']:
         click.echo(f'addr:         {a}')
     for p, link in r['connected']:
@@ -880,18 +1024,14 @@ def status(store: Store) -> None:
 def username(store: Store, name: str | None) -> None:
     if name is not None:
         store.set_config(username=name)
-    click.echo(store.config()['username'] or '(no username set)')
+    click.echo(store.username() or '(no username set)')
 @cli.command()
 @click.argument('peer')
 @click.argument('name', required=False)
 @click.pass_obj
 def nick(store: Store, peer: str, name: str | None) -> None:
-    pid, nicks = (store.resolve(peer), store.config()['nicks'])
-    if name:
-        nicks[pid] = name
-    else:
-        nicks.pop(pid, None)
-    store.set_config(nicks=nicks)
+    pid = store.resolve(peer)
+    store.set_nick(pid, name)
     click.echo(f"{pid} -> {name or '(nickname removed)'}")
 @cli.command()
 @click.argument('peer')
@@ -899,7 +1039,7 @@ def nick(store: Store, peer: str, name: str | None) -> None:
 @click.pass_obj
 def send(store: Store, peer: str, message: tuple[str, ...]) -> None:
     pid = store.resolve(peer)
-    if pid in store.config()['blocked']:
+    if store.is_blocked(pid):
         raise click.ClickException('that peer is blocked; unblock it first')
     daemon_call(store, cmd='send', peer=pid, text=' '.join(message))
     click.echo(f'sent to {store.label(pid)}')
@@ -910,17 +1050,16 @@ def send(store: Store, peer: str, message: tuple[str, ...]) -> None:
 @click.pass_obj
 def read(store: Store, peer: str | None, last: int, follow: bool) -> None:
     pid = store.resolve(peer) if peer else None
-    msgs = [m for m in store.messages() if pid in (None, m['peer']) and m['peer'] not in store.config()['blocked']]
-    for m in msgs[-last:] if last else msgs:
-        click.echo(fmt_msg(store, m))
-    seen = len(store.messages())
-    while follow:
+    seen, limit = (0, last or None)
+    while True:
+        top = store.last_message_id()
+        for m in store.messages(peer=pid, after=seen, last=limit, include_blocked=False):
+            click.echo(fmt_msg(store, m))
+            top = max(top, m['id'])
+        if not follow:
+            return
+        seen, limit = (top, None)
         time.sleep(1)
-        new = store.messages()[seen:]
-        seen += len(new)
-        for m in new:
-            if pid in (None, m['peer']) and m['peer'] not in store.config()['blocked']:
-                click.echo(fmt_msg(store, m))
 @cli.command()
 @click.option('--from', 'source', metavar='PEER', help='Ask PEER for the peers it has encountered instead.')
 @click.option('--named', is_flag=True, help='Only peers with a username or nickname.')
@@ -936,7 +1075,7 @@ def peers(store: Store, source: str | None, named: bool) -> None:
         if named and (not (nickname or name)):
             continue
         flags = ' [blocked]' if pid in cfg['blocked'] else ''
-        click.echo(f"{pid}  username={name or '-'}  nick={nickname or '-'}{flags}")
+        click.echo(clean(f"{pid}  username={name or '-'}  nick={nickname or '-'}{flags}"))
 @cli.command()
 @click.argument('peer')
 @click.pass_obj
@@ -949,14 +1088,14 @@ def find(store: Store, peer: str) -> None:
 @click.pass_obj
 def block(store: Store, peer: str) -> None:
     pid = store.resolve(peer)
-    store.set_config(blocked=sorted({*store.config()['blocked'], pid}))
+    store.block(pid)
     click.echo(f'blocked {pid}')
 @cli.command()
 @click.argument('peer')
 @click.pass_obj
 def unblock(store: Store, peer: str) -> None:
     pid = store.resolve(peer)
-    store.set_config(blocked=[b for b in store.config()['blocked'] if b != pid])
+    store.unblock(pid)
     click.echo(f'unblocked {pid}')
 @cli.command()
 @click.pass_obj
