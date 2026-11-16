@@ -43,7 +43,7 @@ from libp2p.discovery.events.peerDiscovery import peerDiscovery
 from libp2p.host.autonat import AutoNATService, AutoNATStatus
 from libp2p.host.autonat.autonat import AUTONAT_PROTOCOL_ID
 from libp2p.identity.identify_push.identify_push import push_identify_to_peers
-from libp2p.kad_dht.kad_dht import DHTMode, KadDHT
+from libp2p.kad_dht.kad_dht import DHTMode, KadDHT, _encode_key
 from libp2p.network.stream.exceptions import StreamEOF
 from libp2p.peer.id import ID
 from libp2p.peer.peerinfo import PeerInfo, info_from_p2p_addr
@@ -64,6 +64,7 @@ from multiaddr.protocols import P_P2P
 PROTO = TProtocol("/gnosis-mesh/1.0.0")
 MAX_MSG = 1 << 20
 RELAY_TARGET = 3  # public relay reservations to hold while behind NAT
+MESH_TARGET = 8  # chat peers to stay connected to; below this, discover() looks for more
 IPFS_BOOTSTRAP = [  # public IPFS DHT entry points (Kubo defaults)
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
@@ -199,6 +200,11 @@ def addr_order(addr: Multiaddr) -> tuple[bool, bool, int, bool]:
 def rendezvous_key(pid: str) -> str:
     """DHT provider key (hex sha256 multihash) under which a peer announces its addresses."""
     return "1220" + hashlib.sha256(f"gnosis-mesh:{pid}".encode()).hexdigest()
+
+
+# Every node also announces itself under this one shared key, so a node that knows no other chat peer can find
+# some (find_mesh_peers) and then learn the rest through peer exchange. ("/" can't occur in a peer ID.)
+MESH_KEY = "1220" + hashlib.sha256(b"gnosis-mesh:/mesh/1").hexdigest()
 
 
 class Node:
@@ -476,21 +482,101 @@ class Node:
 
     # --- staying reachable and findable ---
     async def announce(self) -> bool:
-        """Self-lookup (so the DHT peers closest to our ID know our addrs) + provider record under our key."""
+        """Self-lookup (so the DHT peers closest to our ID know our addrs) + provider records under our own key
+        (to be found by ID) and the shared MESH_KEY (to be found by nodes bootstrapping into the mesh)."""
         if self.dht.get_routing_table_size() == 0:
             return False
         with trio.move_on_after(120):
             closest = await self.dht.peer_routing.find_closest_peers_network(self.host.get_id().to_bytes())
-            provided = bool(await self.dht.provide(rendezvous_key(self.me)))
-            log.info("announced: %d closest peers, provider record stored=%s", len(closest), provided)
-            return provided
+            stored: dict[str, bool] = {}
+            async with trio.open_nursery() as n:
+                async def provide(name: str, key: str) -> None:
+                    stored[name] = bool(await self.dht.provide(key))
+                n.start_soon(provide, "own", rendezvous_key(self.me))
+                n.start_soon(provide, "mesh", MESH_KEY)
+            log.info("announced: %d closest peers, provider records stored=%s", len(closest), stored)
+            return stored["own"]
         log.info("announce timed out")
         return False
 
+    # --- joining the mesh: get some first chat peers, then grow through peer exchange ---
+    async def find_mesh_peers(self) -> list[PeerInfo]:
+        """Provider records under MESH_KEY, i.e. chat peers we didn't know about. Asks the DHT peers closest to the
+        key directly: py-libp2p's find_providers() returns its local cache whenever that is non-empty (and it
+        always holds at least ourselves once we've announced), so it would never ask the network."""
+        key, store = _encode_key(MESH_KEY), self.dht.provider_store
+        found = {i.peer_id: i for i in store.get_providers(key)}  # records we hold as a DHT server near the key
+        async with trio.open_nursery() as n:
+            async def ask(peer: ID) -> None:
+                with trio.move_on_after(15):
+                    try:
+                        providers, _ = await store._get_providers_from_peer_with_closers(peer, key)
+                        found.update((i.peer_id, i) for i in providers)  # fresher addrs than our cache
+                    except Exception as e:
+                        log.debug("mesh provider query to %s failed: %s", peer, e)
+            for peer in await self.dht.peer_routing.find_closest_peers_network(key):
+                n.start_soon(ask, peer)
+        found.pop(self.host.get_id(), None)
+        return list(found.values())
+
+    async def exchange(self, pid: ID) -> list[ID]:
+        """Peer exchange: the chat peers pid has met (request() also stores their addresses)."""
+        try:
+            reply = await self.request(pid, "peers")
+        except Exception as e:
+            log.debug("peer exchange with %s failed: %s", pid, e)
+            return []
+        out = []
+        for p in reply.get("peers", []):
+            try:
+                out.append(ID.from_base58(p["id"]))
+            except Exception:
+                pass
+        return out
+
+    async def discover(self) -> bool:
+        """While connected to fewer than MESH_TARGET chat peers: collect candidates from the mesh's provider
+        records and from peer exchange with the chat peers we have, then dial a random batch of them."""
+        have = self.chat_peers()
+        if len(have) >= MESH_TARGET:
+            return True
+        if self.dht.get_routing_table_size() == 0 and not have:
+            return False  # nothing to ask yet; retry soon
+        candidates: set[ID] = set()
+        async with trio.open_nursery() as n:
+            async def from_dht() -> None:
+                with trio.move_on_after(60):
+                    try:
+                        for info in await self.find_mesh_peers():
+                            self.learn(info.peer_id, [str(a) for a in info.addrs])
+                            candidates.add(info.peer_id)
+                    except Exception as e:
+                        log.debug("mesh lookup failed: %s", e)
+
+            async def from_peer(pid: ID) -> None:
+                candidates.update(await self.exchange(pid))
+            if self.dht.get_routing_table_size():
+                n.start_soon(from_dht)
+            for pid in have:
+                n.start_soon(from_peer, pid)
+        fresh = [p for p in candidates if p != self.host.get_id() and p not in have and not self.connected(p)
+                 and not self.blocked(p.to_base58())]
+        random.shuffle(fresh)  # spread connections out instead of everyone piling onto the same few peers
+        batch = fresh[:2 * (MESH_TARGET - len(have))]  # some will be offline or unreachable
+        async with trio.open_nursery() as n:
+            for pid in batch:
+                n.start_soon(self.try_connect, pid)
+        log.info("discovery: %d chat peers connected (was %d), %d candidates, dialled %d",
+                 len(self.chat_peers()), len(have), len(fresh), len(batch))
+        return True
+
+    def chat_peers(self) -> list[ID]:
+        """Connected, unblocked peers that speak the chat protocol."""
+        return [p for p in self.host.get_connected_peers() if self.speaks(p, PROTO) and not self.blocked(p.to_base58())]
+
     def chat_relays(self) -> list[ID]:
         """Connected chat peers offering the relay (hop) service, i.e. usable rendezvous points."""
-        return [p for p in self.host.get_connected_peers()
-                if self.speaks(p, PROTO) and self.speaks(p, HOP_PROTOCOL_ID) and not self.blocked(p.to_base58())]
+        return [p for p in self.chat_peers() if self.speaks(p, HOP_PROTOCOL_ID)]
 
     async def hop_acl(self, stream: INetStream) -> None:
         """Relay only for fellow chat peers (we are a rendezvous point for them, not a public relay)."""
@@ -582,6 +668,7 @@ class Node:
             n.start_soon(self.every, 15, self.keep_relays)
             n.start_soon(self.every, 5, self.watch_addrs)
             n.start_soon(self.announce_loop)
+            n.start_soon(self.every, 60, self.discover)
 
     async def background(self) -> None:
         """Reconnect to known/bootstrap peers on start; then greet every chat peer we connect to."""

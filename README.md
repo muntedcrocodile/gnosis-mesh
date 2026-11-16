@@ -25,6 +25,8 @@ $ gnosis_mesh.py read
 
 - **Find peers by peer ID alone.** Lookups use the public IPFS DHT (Kademlia), LAN discovery (mDNS), and peer
   exchange with chat peers you already know.
+- **Joins the mesh on its own.** A new node that knows nobody finds other gnosis-mesh nodes through a shared DHT
+  key, then meets more of them through peer exchange.
 - **Peer lists on request.** Any peer will tell you which other chat peers it has met (`peers --from`).
 - **Usernames and nicknames.** Each peer chooses a username that others see when they meet it. You can override
   anyone's username with your own local nickname. Every command accepts a peer ID, a username or a nickname.
@@ -163,6 +165,25 @@ change (for example after getting a new relay reservation). Announcing means two
 
 After that, peers reconnect straight away using the addresses they've stored.
 
+### Joining the mesh
+
+A brand-new node knows no other chat peers. To get its first ones:
+
+- **Every node announces itself under one shared DHT key** (`MESH_KEY`) as well as its own, so any node can look
+  up "some gnosis-mesh nodes" without knowing a single peer ID.
+- **Every 60 s, while connected to fewer than 8 chat peers**, the node:
+  1. asks the DHT servers closest to that key for its provider records;
+  2. asks each chat peer it's connected to for the peers *it* has met (peer exchange);
+  3. dials a random selection of the new candidates. The selection is random so that new nodes don't all pile
+     onto the same few peers.
+
+Every peer it reaches is saved in `peers.json` and reconnected on the next start. So the DHT is only needed
+the first time, or when every known peer has gone away.
+
+**Measured on the public IPFS DHT:** a brand-new node, with mDNS off and no bootstrap peers or saved peers, found
+and connected to the only other gnosis-mesh node about 60 s after starting. Both nodes were behind NAT. That
+was its first discovery round once its DHT routing table had filled.
+
 Use `--private` for a closed group (a LAN, or your own bootstrap node with `-b`). Discovery then uses only
 mDNS, peer exchange and a DHT made up of the chat peers themselves.
 
@@ -243,6 +264,9 @@ or the system temp directory if that isn't set. If the resulting path would be t
 - **Message history and settings are stored unencrypted** in the data directory.
 - **Joining the public DHT makes your peer ID and addresses public.** Anyone can look you up and see your IP
   addresses or your relay addresses. Use `--private` if that's a problem.
+- **Anyone can list gnosis-mesh nodes.** The shared mesh key tells anyone who looks it up which peer IDs and
+  addresses run gnosis-mesh, and anyone can publish fake records under it. Candidates are only used once they
+  connect and answer on the chat protocol.
 - **Your node relays traffic for other chat peers.** That's what makes the shared-peer rendezvous work. It's
   limited to peers that speak this chat protocol and aren't blocked, with per-connection limits of 1 hour and
   16 MiB.
@@ -266,7 +290,8 @@ and closes its write side, then reads one JSON reply:
 `name` is the sender's current username (an empty string if it hasn't set one). A blocked peer's streams are
 reset without a reply.
 
-The provider record key for a peer is the sha256 multihash of `gnosis-mesh:<peer ID>`.
+The provider record key for a peer is the sha256 multihash of `gnosis-mesh:<peer ID>`. Every node also provides
+the shared mesh key, the sha256 multihash of `gnosis-mesh:/mesh/1`.
 
 ---
 
@@ -296,6 +321,8 @@ The provider record key for a peer is the sha256 multihash of `gnosis-mesh:<peer
   still used for direct dials.
 - **First contact over the public DHT is slow** (around 30–60 s), mostly because py-libp2p's Kademlia lookups
   are slow.
+- **The mesh key only finds a sample of nodes.** Each DHT server keeps at most 20 provider records per key, so
+  a lookup returns a few dozen nodes at most. Peer exchange finds the rest.
 - **Messages to offline peers aren't queued.** `send` fails if the peer can't be reached.
 
 ### py-libp2p workarounds
