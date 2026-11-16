@@ -14,7 +14,7 @@ from libp2p.peer.peerstore import PeerStore
 from libp2p.relay.circuit_v2.pb.circuit_pb2 import HopMessage, PeerId
 
 from conftest import new_pid
-from gnosis_mesh import MAX_ADDRS, MAX_TEXT, MESH_KEY, PEX_LIMIT, AsyncStore, Node, Store
+from gnosis_mesh import MAX_ADDRS, MAX_TEXT, MESH_KEY, PEX_LIMIT, Node, Store
 
 
 class FakeStream:
@@ -51,7 +51,7 @@ def node_with(store: Store, reply: FakeStream | None = None) -> Any:
     async def new_stream(*_: Any) -> FakeStream:
         return fake.reply
 
-    fake = SimpleNamespace(store=store, astore=AsyncStore(store.home), reply=reply, echo=False, greeted=set(),
+    fake = SimpleNamespace(store=store, reply=reply, echo=False, greeted=set(),
                            recent_ids=collections.deque(maxlen=1000), protocols={},
                            host=SimpleNamespace(new_stream=new_stream, get_peerstore=lambda: peerstore,
                                                 get_id=lambda: me))
@@ -64,7 +64,7 @@ def node_with(store: Store, reply: FakeStream | None = None) -> Any:
 # --- peer exchange ---
 
 def test_peer_exchange_reply_is_capped_and_not_learned(store: Store) -> None:
-    """A reply can name any IDs: we keep at most PEX_LIMIT and add none to the peerstore (it holds only 1000)."""
+    """A reply can name any IDs: we keep at most PEX_LIMIT and add none to the peerstore (it evicts when full)."""
     named = [{"id": pid().to_base58(), "addrs": ["/ip4/10.0.0.1/tcp/1"]} for _ in range(PEX_LIMIT + 20)]
     fake = node_with(store, FakeStream({"name": "bob", "peers": named}))
     reply = trio.run(Node.request, fake, pid(), "peers")
@@ -134,10 +134,9 @@ def test_remote_text_is_cleaned_and_bounded(store: Store) -> None:
 
 def test_retry_after_a_failed_write_is_stored(store: Store) -> None:
     fake, alice = node_with(store), pid()
-    real = fake.astore.store.log_message
-    fake.astore.store.log_message = lambda *a: (_ for _ in ()).throw(OSError("database is locked"))
+    store.log_message = lambda *a: (_ for _ in ()).throw(OSError("database is locked"))
     assert deliver(fake, alice, {"t": "msg", "text": "hi", "id": "m1"}).was_reset  # failed: no ack
-    fake.astore.store.log_message = real
+    del store.log_message  # back to the real method
     assert not deliver(fake, alice, {"t": "msg", "text": "hi", "id": "m1"}).was_reset
     assert [m["text"] for m in store.messages()] == ["hi"]
 

@@ -332,8 +332,8 @@ the shared mesh key, the sha256 multihash of `gnosis-mesh:/mesh/1`.
 - `BasicHost.get_addrs()` mangles `/p2p-circuit` addresses, so the node builds its advertised address list
   itself.
 - The wildcard-address helper drops `/quic-v1`, so the node expands `0.0.0.0` / `::` itself.
-- The peerstore can evict the node's *own* entry once it holds more than 1000 peers. Identify then crashes the
-  host, so the node serves its own keys directly.
+- The peerstore evicts its oldest entries (the longest-connected chat peers, or the node's *own* entry, which
+  crashes identify) once full, so the node raises its limit from 1000 to 20,000 and serves its own keys directly.
 - DCUtR binds hole-punch dials to the *first* advertised TCP address, so addresses are advertised in order:
   IPv4 before IPv6, loopback last.
 - The swarm only dials one address per transport, so the node uses its own dialer, which tries every address

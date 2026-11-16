@@ -4,7 +4,7 @@ Branch `experiment/sqlite-backend`. Status: a working prototype. Tests pass, and
 messages using it.
 
 **Recommendation: adopt with changes.** Replace `config.json`, `peers.json` and `messages.jsonl` with one
-`store.db` that uses the standard-library `sqlite3` module in WAL mode. Reads run inline; the daemon's writes go through `AsyncStore`.
+`store.db` that uses the standard-library `sqlite3` module in WAL mode. The daemon calls it inline from trio.
 Keep `key` as its own file. The changes still needed before merging to `main` are listed at the end.
 
 ## 1. What is wrong today, measured
@@ -49,41 +49,30 @@ point lookup or range scan.
 
 ## 2. stdlib `sqlite3` vs async drivers under trio
 
-**Use stdlib `sqlite3`: reads inline on the trio thread, daemon writes in a worker thread (`AsyncStore`).**
+**Use stdlib `sqlite3`, called inline on the trio thread.**
 
 * **There is no trio-native driver worth using.** `aiosqlite` is asyncio-only and doesn't run under trio. Async
-  SQLAlchemy needs an asyncio driver too. Every "async SQLite" library is really a worker thread plus a queue, so
-  `trio.to_thread.run_sync` is the honest way to do it.
-* **Writes can block for seconds, so they go to a thread.** A write waits up to `busy_timeout` (5 s) whenever
-  another process holds the write lock, for example the CLI running `block`, `nick` or a startup prune. Run inline,
-  that wait freezes the daemon's whole event loop, networking included. `AsyncStore` runs `remember_peer` and
-  `log_message` in a worker thread instead. The hop costs about 90 µs per write (about 41 µs inline
-  versus about 129 µs threaded), which is negligible next to a network round trip.
-  `tests/test_async.py` holds the lock from another process for 0.5 s and checks that the event loop never pauses
-  for more than 0.25 s. It also checks that the same write done inline does stall for the whole lock.
-* **Writes are serialised and ordered.** `AsyncStore` uses a `trio.CapacityLimiter(1)`, which is FIFO, so writes
-  run one at a time in the order they were awaited. Messages are stored in the order they were logged, and there's
-  never more than one thread waiting on the lock.
-* **Cancellation is safe.** `trio.to_thread.run_sync` waits for the thread to finish before delivering a
-  cancellation, so a write whose task is cancelled still commits exactly once and leaves no transaction open
-  (tested).
-* **Reads stay inline.** In WAL mode readers never wait for writers, and a point read (`is_blocked`, `label`,
-  `has_peer`) is far cheaper than a thread hop.
-* **Two connections in the daemon.** The trio thread reads through the daemon's `Store`. `AsyncStore` opens its own
-  `Store`, which only one worker thread uses at a time (enforced by the limiter), so no connection is ever shared
-  between threads at once. SQLite's file locking serialises the two connections exactly as it does the CLI and the
-  daemon.
-* **No transactions span an `await`.** Every write is a single autocommit statement, run within one synchronous
-  call on one thread.
-* **When to reconsider.** If the daemon starts running heavy queries, such as full-text search over a large
-  history or bulk exports, run them through `AsyncStore.run(...)` too.
+  SQLAlchemy needs an asyncio driver too. Every "async SQLite" library is really a worker thread plus a queue.
+* **Inline calls are fast.** A write takes about 41 µs, a point read (`is_blocked`, `label`, `has_peer`) less, which
+  is negligible next to a network round trip. In WAL mode readers never wait for writers.
+* **The one cost: a write can wait for another process.** A write waits up to `busy_timeout` (5 s) while another
+  process holds the write lock, and inline that wait pauses the daemon's event loop. Nothing in the app holds the
+  lock for more than one short statement (the CLI's `block`, `nick`, `peers` prune), so in practice the pause is
+  microseconds. An earlier version ran daemon writes in a worker thread (`trio.to_thread` behind a FIFO limiter)
+  to rule this out; it was removed to keep the code small, and because the thread hop let a queued write race a
+  `block` and the duplicate-message check.
+* **No transactions span an `await`.** Every write is a single autocommit statement in one synchronous call, so a
+  cancelled task can never leave a transaction open.
+* **When to reconsider.** If the daemon starts running heavy queries (full-text search over a large history,
+  bulk exports) or something starts holding the write lock for long, run those calls through
+  `trio.to_thread.run_sync` on a separate connection.
 
 ## 3. WAL mode and CLI + daemon concurrency
 
-The CLI opens one connection and the daemon two (its own and `AsyncStore`'s), all with these settings:
+The CLI and the daemon each open one connection, with these settings:
 
 ```python
-sqlite3.connect(path, isolation_level=None, timeout=5, check_same_thread=False)  # autocommit; timeout = busy_timeout
+sqlite3.connect(path, isolation_level=None, timeout=5)  # autocommit; timeout = busy_timeout
 PRAGMA journal_mode=WAL      # readers never block the writer and vice versa; persists in the file
 PRAGMA synchronous=NORMAL    # no fsync per commit; safe against app crashes; an OS crash may lose the last commit
 ```
@@ -145,7 +134,7 @@ New methods were added for the hot paths:
 ### Call-site changes outside `Store`
 
 * `Node.blocked` calls `store.is_blocked`.
-* `Node.remember` and message logging are awaited through `AsyncStore` (see section 2).
+* `Node.remember` and message logging call the store directly (see section 2).
 * `Node.handle`: the `peers` reply uses `store.recent_peers(PEX_LIMIT)`.
 * `Node.find` and the `status` command use `store.has_peer` instead of loading every peer.
 * `Node.background` dials `store.recent_peers(DIAL_ON_START)` (the 64 most recent) instead of every peer.
@@ -190,7 +179,7 @@ processes starting at once are harmless. If the schema ever needs to change, add
    and bounded peer-exchange replies are O(log n) instead of rewriting or re-parsing whole files. `read` and
    `read -f` stop re-parsing the whole history (from 187 ms to under 0.1 ms at 100k messages).
 3. The cost is low. It uses only the standard library, with no new dependency (`requirements.txt` is unchanged).
-   Async use needs only a small `AsyncStore` wrapper around `trio.to_thread`. The `Store` interface is mostly
+   The daemon calls it inline from trio (see section 2). The `Store` interface is mostly
    preserved, and the `Node` changes are a handful of small call-site edits.
 4. You can still inspect the data with `sqlite3 store.db`.
 
@@ -207,7 +196,7 @@ database by hand and still rewrite the whole peers file on every request.
 
 ## Tests
 
-`.venv/bin/python -m pytest` runs 37 tests in about 9 seconds:
+`.venv/bin/python -m pytest` runs 33 tests in about 6 seconds:
 
 * `tests/test_store.py`: round-trips for config, nicknames, blocks, peers (`UPSERT` semantics and ordering),
   pruning (age, cap, exemptions, hourly trigger), messages (filters, `last`, `after`, blocked), `label`/`resolve`,
@@ -215,9 +204,6 @@ database by hand and still rewrite the whole peers file on every request.
 * `tests/test_concurrency.py`: two processes writing peers (including the same rows), messages, blocks and
   nicknames at once with no lost updates, and a `read -f` style cursor seeing every message from another process
   exactly once.
-* `tests/test_async.py`: `AsyncStore` with 20 concurrent trio tasks (nothing lost, per-task order kept), a write
-  lock held by another process without stalling the event loop (with an inline control), and cancellation while a
-  write is blocked.
 * `tests/test_node.py`: real `Node` methods with a real libp2p peerstore and stand-in streams. It covers:
   * peer-exchange replies capped and not added to the peerstore, and `learn` keeping the newest addresses;
   * the `peers` reply's cap and requester exclusion;

@@ -32,7 +32,7 @@ import tempfile
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any
 
 import click
 import multihash
@@ -50,7 +50,7 @@ from libp2p.kad_dht.kad_dht import DHTMode, KadDHT, _encode_key
 from libp2p.network.stream.exceptions import StreamEOF
 from libp2p.peer.id import ID
 from libp2p.peer.peerinfo import PeerInfo, info_from_p2p_addr
-from libp2p.peer.peerstore import PERMANENT_ADDR_TTL
+from libp2p.peer.peerstore import PERMANENT_ADDR_TTL, PeerStore
 from libp2p.relay.circuit_v2.config import RelayConfig, RelayRole
 from libp2p.relay.circuit_v2.dcutr import DCUtRProtocol
 from libp2p.relay.circuit_v2.protocol import PROTOCOL_ID as HOP_PROTOCOL_ID
@@ -101,7 +101,6 @@ CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, ts RE
                                      dir TEXT NOT NULL CHECK (dir IN ('in', 'out')), text TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS messages_peer ON messages (peer, id);
 """
-T = TypeVar("T")
 
 
 class Store:
@@ -123,9 +122,8 @@ class Store:
         if not self.db_path.exists():  # messages are private: create the db (SQLite copies its mode to -wal/-shm) 0600
             os.close(os.open(self.db_path, os.O_WRONLY | os.O_CREAT, 0o600))
         # Autocommit: every write is a single statement. WAL lets readers proceed while one writer commits;
-        # busy_timeout covers the brief writer-vs-writer overlap. Not tied to the creating thread so AsyncStore can
-        # use its own Store from worker threads, but only one thread may use a Store at a time.
-        self.db = sqlite3.connect(self.db_path, isolation_level=None, timeout=5, check_same_thread=False)
+        # busy_timeout covers the brief writer-vs-writer overlap.
+        self.db = sqlite3.connect(self.db_path, isolation_level=None, timeout=5)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")  # durable across app crashes; an OS crash may lose the last commit
@@ -269,26 +267,6 @@ class Store:
         raise click.ClickException(f"'{who}' is not a known nickname, username or valid peer ID")
 
 
-class AsyncStore:
-    """Awaitable writes for trio code, on a connection of their own. A write can wait up to busy_timeout (5 s) for
-    another process's write lock (the CLI running `block`, say); inline, that would freeze the event loop, so writes
-    run in a worker thread, one at a time and in the order awaited (trio's limiter is FIFO). A cancelled caller
-    still lets its write finish, so none is left half-done. Reads stay synchronous on the caller's Store: in WAL
-    mode readers never wait for writers."""
-
-    def __init__(self, home: Path) -> None:
-        self.store, self._writer = Store(home), trio.CapacityLimiter(1)
-
-    async def run(self, fn: Callable[..., T], *args: Any) -> T:
-        return await trio.to_thread.run_sync(fn, *args, limiter=self._writer)
-
-    async def remember_peer(self, pid: str, addrs: list[str], name: str | None) -> None:
-        await self.run(self.store.remember_peer, pid, addrs, name)
-
-    async def log_message(self, peer: str, direction: str, text: str) -> None:
-        await self.run(self.store.log_message, peer, direction, text)
-
-
 # ---------- libp2p daemon ----------
 
 async def read_all(stream: INetStream) -> bytes:
@@ -354,7 +332,6 @@ MESH_KEY = "1220" + hashlib.sha256(b"gnosis-mesh:/mesh/1").hexdigest()
 class Node:
     def __init__(self, store: Store, port: int, bootstrap: list[str], echo: bool, mdns: bool, public: bool) -> None:
         self.store, self.bootstrap, self.echo, self.public = store, bootstrap, echo, public
-        self.astore = AsyncStore(store.home)  # daemon writes go through here so a busy db never blocks the event loop
         fams = ["/ip4/0.0.0.0"] + (["/ip6/::"] if is_ipv6_available() else [])
         self.listen = [Multiaddr(f"{f}/{t}") for f in fams for t in (f"tcp/{port}", f"udp/{port}/quic-v1")]
         self.keys = create_new_key_pair(store.key_seed())
@@ -364,12 +341,14 @@ class Node:
             # encryption and claim any peer ID.
             sec_opt={NOISE_PROTOCOL_ID: NoiseTransport(self.keys, noise_privkey=create_x25519_key_pair().private_key)},
             enable_mDNS=mdns, enable_upnp=public, bootstrap=bootstrap + (IPFS_BOOTSTRAP if public else []) or None,
-            bootstrap_allow_ipv6=True, addrs_factory=lambda addrs: [x for a in addrs for x in expand(a)])
+            bootstrap_allow_ipv6=True, addrs_factory=lambda addrs: [x for a in addrs for x in expand(a)],
+            # Full, the peerstore evicts its oldest entries, i.e. the chat peers we've been connected to longest.
+            peerstore_opt=PeerStore(max_peers=20_000))
         # BasicHost.get_addrs() truncates /p2p/<relay>/p2p-circuit addrs, so we build the advertised list ourselves
         # (identify, signed peer records and DHT provider records all read it).
         self.direct_addrs = self.host.get_addrs
         self.host.get_addrs = self.advertised  # type: ignore[method-assign]
-        # The peerstore can evict our *own* entry once it holds >1000 peers (easy on the public DHT); identify
+        # The peerstore can evict our *own* entry once it is full (possible on the public DHT); identify
         # then raises and takes the host down. Serve our keys directly instead.
         self.host.get_public_key = lambda: self.keys.public_key  # type: ignore[method-assign]
         self.host.get_private_key = lambda: self.keys.private_key  # type: ignore[method-assign]
@@ -462,10 +441,10 @@ class Node:
     def blocked(self, pid: str) -> bool:
         return self.store.is_blocked(pid)
 
-    async def remember(self, pid: ID, name: str | None) -> None:
+    def remember(self, pid: ID, name: str | None) -> None:
         """Record an encountered chat peer (with its self-assigned username) in the store."""
         name = clean(name)[:MAX_NAME] if isinstance(name, str) else None  # untrusted: stored and re-shared via PEX
-        await self.astore.remember_peer(pid.to_base58(), [str(a) for a in self.addrs(pid)][:MAX_ADDRS], name)
+        self.store.remember_peer(pid.to_base58(), [str(a) for a in self.addrs(pid)][:MAX_ADDRS], name)
 
     # --- the /gnosis-mesh protocol: one JSON request + one JSON reply per stream ---
     async def handle(self, stream: INetStream) -> None:
@@ -486,7 +465,7 @@ class Node:
                     mid = req.get("id")  # older peers send none; a retry of a delivered message is dropped
                     key = (pid, mid) if isinstance(mid, str) and len(mid) <= 64 else None
                     if key is None or key not in self.recent_ids:
-                        await self.astore.log_message(pid.to_base58(), "in", text)
+                        self.store.log_message(pid.to_base58(), "in", text)
                         if key:  # only once stored, so a retry after a failed write is stored after all
                             self.recent_ids.append(key)
                         if self.echo:
@@ -494,7 +473,7 @@ class Node:
                 elif req["t"] == "peers":
                     reply["peers"] = [{"id": k, **v} for k, v in self.store.recent_peers(PEX_LIMIT).items()
                                       if k != pid.to_base58()]
-                await self.remember(pid, req.get("name"))
+                self.remember(pid, req.get("name"))
                 await stream.write(json.dumps(reply).encode())
                 await stream.close()
                 self.greeted.add(pid)
@@ -514,13 +493,13 @@ class Node:
                 with trio.move_on_after(1, shield=True):
                     await stream.reset()
                 raise
-        await self.remember(pid, reply.get("name"))
+        self.remember(pid, reply.get("name"))
         reply["peers"] = reply["peers"][:PEX_LIMIT] if isinstance(reply.get("peers"), list) else []
         return reply
 
     async def exchange(self, other: ID) -> dict[ID, Any]:
         """Peer exchange: {peer: addrs} of the chat peers `other` has met. Not learned here: a reply can name any
-        IDs, and adding them all to the peerstore would evict the peers we actually know (it holds 1000)."""
+        IDs, and adding them all to the peerstore would evict the peers we actually know."""
         offered: dict[ID, Any] = {}
         with contextlib.suppress(Exception):
             for p in (await self.request(other, "peers"))["peers"]:
@@ -894,7 +873,7 @@ class Node:
             try:
                 if req["cmd"] == "send":
                     await self.request(pid, "msg", text=req["text"], id=mid)
-                    await self.astore.log_message(req["peer"], "out", req["text"])
+                    self.store.log_message(req["peer"], "out", req["text"])
                     return {}
                 if req["cmd"] == "peers":
                     return await self.request(pid, "peers")
@@ -931,7 +910,6 @@ class Node:
         try:
             await self.serve()
         finally:
-            self.astore.store.close()
             with trio.CancelScope(shield=True):
                 await self.shutdown()
 
