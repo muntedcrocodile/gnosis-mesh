@@ -8,11 +8,12 @@ from types import SimpleNamespace
 
 import click
 import pytest
+import trio
 from libp2p.peer.id import ID
 from multiaddr import Multiaddr
 
 from conftest import new_pid
-from gnosis_mesh import Node, Store
+from gnosis_mesh import AsyncStore, Node, Store
 
 
 # --- config ---
@@ -181,10 +182,10 @@ def test_db_is_private_and_in_wal_mode(store: Store, home: Path) -> None:
 
 def test_node_remember_and_blocked_use_store(store: Store) -> None:
     pid = ID.from_base58(new_pid())
-    fake = SimpleNamespace(store=store, addrs=lambda _: [Multiaddr("/ip4/1.2.3.4/tcp/4777")])
-    Node.remember(fake, pid, "alice")  # type: ignore[arg-type]
+    fake = SimpleNamespace(store=store, astore=AsyncStore(store), addrs=lambda _: [Multiaddr("/ip4/1.2.3.4/tcp/4777")])
+    trio.run(Node.remember, fake, pid, "alice")  # type: ignore[arg-type]
     fake.addrs = lambda _: []
-    Node.remember(fake, pid, None)  # type: ignore[arg-type]
+    trio.run(Node.remember, fake, pid, None)  # type: ignore[arg-type]
     assert store.peers()[pid.to_base58()]["addrs"] == ["/ip4/1.2.3.4/tcp/4777"]
     assert store.label(pid.to_base58()) == "alice"
     assert not Node.blocked(fake, pid.to_base58())  # type: ignore[arg-type]

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
 import ipaddress
 import json
@@ -28,10 +29,11 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, ParamSpec, TypeVar
 
 import click
 import multihash
@@ -98,6 +100,8 @@ CREATE INDEX messages_peer ON messages (peer, id);
 """
 SCHEMA_VERSION = 1
 LEGACY_FILES = ("config.json", "peers.json", "messages.jsonl")
+P = ParamSpec("P")
+T = TypeVar("T")
 
 
 def socket_path(home: Path) -> str:
@@ -124,17 +128,43 @@ class Store:
         self.db_path = home / "store.db"
         if not self.db_path.exists():  # messages are private: create the db (SQLite copies its mode to -wal/-shm) 0600
             os.close(os.open(self.db_path, os.O_WRONLY | os.O_CREAT, 0o600))
-        # Autocommit; writes that must be atomic use _tx(). The CLI and the daemon each hold one connection and
-        # WAL lets readers proceed while one writer commits; busy_timeout covers the brief writer-vs-writer overlap.
-        self.db = sqlite3.connect(self.db_path, isolation_level=None, timeout=5)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA synchronous=NORMAL")  # durable across app crashes; an OS crash may lose the last commit
+        # One connection per thread, so the Store can be used from any thread (trio.to_thread workers, callbacks):
+        # a sqlite3 connection must not be shared between threads, and a shared one would let two threads'
+        # transactions interleave. SQLite's own locking then serialises them exactly as it does the CLI and daemon.
+        self._local = threading.local()
+        self._conns: list[tuple[threading.Thread, sqlite3.Connection]] = []
+        self._conns_lock = threading.Lock()
         self._last_prune = time.time()
         self._migrate()
 
+    @property
+    def db(self) -> sqlite3.Connection:
+        """This thread's connection, opened on first use."""
+        conn: sqlite3.Connection | None = getattr(self._local, "db", None)
+        if conn is None:
+            # Autocommit; writes that must be atomic use _tx(). WAL lets readers proceed while one writer commits;
+            # busy_timeout covers the brief writer-vs-writer overlap. check_same_thread=False only so close() can
+            # close other threads' connections: each connection is still used by its own thread alone.
+            conn = sqlite3.connect(self.db_path, isolation_level=None, timeout=5, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")  # durable across app crashes; an OS crash may lose the last commit
+            self._local.db = conn
+            with self._conns_lock:  # close connections of threads that have exited (e.g. idle trio workers)
+                for thread, old in self._conns:
+                    if not thread.is_alive():
+                        old.close()
+                self._conns = [(t, c) for t, c in self._conns if t.is_alive()]
+                self._conns.append((threading.current_thread(), conn))
+        return conn
+
     def close(self) -> None:
-        self.db.close()
+        """Close every thread's connection. Call it once no other thread is using the Store."""
+        with self._conns_lock:
+            for _, conn in self._conns:
+                conn.close()
+            self._conns = []
+        self._local = threading.local()
 
     @contextlib.contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -347,6 +377,34 @@ class Store:
             raise click.ClickException(f"'{who}' is not a known nickname, username or valid peer ID")
 
 
+class AsyncStore:
+    """Awaitable writes for trio code. A write can wait up to busy_timeout (5 s) for another process's write lock
+    (the CLI running `block` or `nick`, say); run inline, that wait would freeze the whole event loop, so these run
+    in a worker thread instead. One write at a time, in the order they were awaited (trio's limiter is FIFO), so
+    messages are stored in the order they were logged. If the awaiting task is cancelled, the write still finishes
+    before the cancellation is delivered, so it is never left half-done.
+
+    Reads stay synchronous on the Store: in WAL mode readers never wait for writers, and a thread hop costs more
+    than a point read. Don't hold a Store transaction across an `await`; every Store method is self-contained."""
+
+    def __init__(self, store: Store) -> None:
+        self.store = store
+        self._writer = trio.CapacityLimiter(1)
+
+    async def run(self, fn: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+        """Run any Store method (or other blocking call) in the writer thread."""
+        return await trio.to_thread.run_sync(functools.partial(fn, *args, **kwargs), limiter=self._writer)
+
+    async def remember_peer(self, pid: str, addrs: list[str], name: str | None, seen: float | None = None) -> None:
+        await self.run(self.store.remember_peer, pid, addrs, name, seen)
+
+    async def log_message(self, peer: str, direction: str, text: str) -> None:
+        await self.run(self.store.log_message, peer, direction, text)
+
+    async def prune_peers(self, ttl: float | None = None, keep: int | None = None) -> int:
+        return await self.run(self.store.prune_peers, ttl, keep)
+
+
 # ---------- libp2p daemon ----------
 
 async def read_all(stream: INetStream) -> bytes:
@@ -407,6 +465,7 @@ MESH_KEY = "1220" + hashlib.sha256(b"gnosis-mesh:/mesh/1").hexdigest()
 class Node:
     def __init__(self, store: Store, port: int, bootstrap: list[str], echo: bool, mdns: bool, public: bool) -> None:
         self.store, self.bootstrap, self.echo, self.public = store, bootstrap, echo, public
+        self.astore = AsyncStore(store)  # daemon writes go through here so a busy db never blocks the event loop
         fams = ["/ip4/0.0.0.0"] + (["/ip6/::"] if is_ipv6_available() else [])
         self.listen = [Multiaddr(f"{f}/{t}") for f in fams for t in (f"tcp/{port}", f"udp/{port}/quic-v1")]
         self.keys = create_new_key_pair(store.key_seed())
@@ -508,9 +567,9 @@ class Node:
     def blocked(self, pid: str) -> bool:
         return self.store.is_blocked(pid)
 
-    def remember(self, pid: ID, name: str | None) -> None:
+    async def remember(self, pid: ID, name: str | None) -> None:
         """Record an encountered chat peer (with its self-assigned username) in the store."""
-        self.store.remember_peer(pid.to_base58(), [str(a) for a in self.addrs(pid)], name)
+        await self.astore.remember_peer(pid.to_base58(), [str(a) for a in self.addrs(pid)], name)
 
     # --- the /gnosis-mesh protocol: one JSON request + one JSON reply per stream ---
     async def handle(self, stream: INetStream) -> None:
@@ -520,10 +579,10 @@ class Node:
             return
         try:
             req = json.loads(await read_all(stream))
-            self.remember(pid, req.get("name"))
+            await self.remember(pid, req.get("name"))
             reply: Json = {"name": self.store.config()["username"]}
             if req["t"] == "msg":
-                self.store.log_message(pid.to_base58(), "in", req["text"])
+                await self.astore.log_message(pid.to_base58(), "in", req["text"])
                 if self.echo:
                     click.echo(f"\n[{self.store.label(pid.to_base58())}] {req['text']}")
             elif req["t"] == "peers":
@@ -543,7 +602,7 @@ class Node:
             await stream.close_write()  # type: ignore[attr-defined]  # NetStream has it; the ABC doesn't
             reply = json.loads(await read_all(stream))
             await stream.close()
-        self.remember(pid, reply.get("name"))
+        await self.remember(pid, reply.get("name"))
         for p in reply.get("peers", []):  # peer exchange: learn addresses of peers they met
             try:
                 self.learn(ID.from_base58(p["id"]), p.get("addrs", []))
@@ -929,7 +988,7 @@ class Node:
             try:
                 if req["cmd"] == "send":
                     await self.request(pid, "msg", text=req["text"])
-                    self.store.log_message(req["peer"], "out", req["text"])
+                    await self.astore.log_message(req["peer"], "out", req["text"])
                     return {}
                 if req["cmd"] == "peers":
                     return await self.request(pid, "peers")
