@@ -13,7 +13,7 @@ from libp2p.peer.id import ID
 from multiaddr import Multiaddr
 
 from conftest import new_pid
-from gnosis_mesh import AsyncStore, Node, Store
+from gnosis_mesh import MAX_NAME, AsyncStore, Node, Store
 
 
 # --- config ---
@@ -24,7 +24,10 @@ def test_config_defaults(store: Store) -> None:
 
 
 def test_set_config_round_trip_and_persists(store: Store, home: Path) -> None:
-    store.set_config(username="alice", nicks={"p1": "bob"}, blocked=["p3", "p2"], theme={"dark": True})
+    store.set_config(username="alice", theme={"dark": True})
+    store.set_nick("p1", "bob")
+    store.block("p3")
+    store.block("p2")
     store.set_config(username="alice2")  # only replaces the given key
     expected = {"username": "alice2", "nicks": {"p1": "bob"}, "blocked": ["p2", "p3"], "theme": {"dark": True}}
     assert store.config() == expected
@@ -32,13 +35,6 @@ def test_set_config_round_trip_and_persists(store: Store, home: Path) -> None:
     assert reopened.config() == expected
     assert reopened.username() == "alice2"
     reopened.close()
-
-
-def test_set_config_replaces_whole_nicks_and_blocked(store: Store) -> None:
-    store.set_config(nicks={"p1": "a", "p2": "b"}, blocked=["p1", "p2"])
-    store.set_config(nicks={"p2": "c"}, blocked=["p2"])
-    assert store.config()["nicks"] == {"p2": "c"}
-    assert store.config()["blocked"] == ["p2"]
 
 
 def test_nick_and_block_helpers(store: Store) -> None:
@@ -78,13 +74,6 @@ def test_peers_keeps_first_met_order_and_recent_peers_is_newest_first(store: Sto
     store.block("c")
     assert list(store.recent_peers(2, exclude_blocked=True)) == ["b", "a"]
     assert store.has_peer("a") and not store.has_peer("zz")
-
-
-def test_save_peers_replaces_everything(store: Store) -> None:
-    store.remember_peer("old", [], "x")
-    store.save_peers({"p1": {"name": "n", "addrs": ["/ip4/1.1.1.1/tcp/1"], "seen": 5.0}, "p2": {"seen": 6.0}})
-    assert store.peers() == {"p1": {"name": "n", "addrs": ["/ip4/1.1.1.1/tcp/1"], "seen": 5.0},
-                             "p2": {"addrs": [], "seen": 6.0}}
 
 
 def test_prune_by_age_spares_nicknamed_and_correspondents(store: Store) -> None:
@@ -188,6 +177,10 @@ def test_node_remember_and_blocked_use_store(store: Store) -> None:
     trio.run(Node.remember, fake, pid, None)  # type: ignore[arg-type]
     assert store.peers()[pid.to_base58()]["addrs"] == ["/ip4/1.2.3.4/tcp/4777"]
     assert store.label(pid.to_base58()) == "alice"
+    trio.run(Node.remember, fake, pid, "x" * 10_000)  # type: ignore[arg-type]  # untrusted: capped
+    assert store.label(pid.to_base58()) == "x" * MAX_NAME
+    trio.run(Node.remember, fake, pid, {"not": "a string"})  # type: ignore[arg-type]  # ignored, name kept
+    assert store.label(pid.to_base58()) == "x" * MAX_NAME
     assert not Node.blocked(fake, pid.to_base58())  # type: ignore[arg-type]
     store.block(pid.to_base58())
     assert Node.blocked(fake, pid.to_base58())  # type: ignore[arg-type]

@@ -70,6 +70,8 @@ MAX_MSG = 1 << 20
 RELAY_TARGET = 3  # public relay reservations to hold while behind NAT
 MESH_TARGET = 8  # chat peers to stay connected to; below this, discover() looks for more
 DIAL_ON_START = 64  # most recently seen known peers to reconnect to when the node starts
+MAX_NAME = 64  # longest username we store or pass on (a remote peer chooses it)
+MAX_ADDRS = 32  # most addresses we accept for one peer from a peer-exchange reply
 PEX_LIMIT = 200  # most recently seen peers to share in a "peers" reply (keeps it well under MAX_MSG)
 IPFS_BOOTSTRAP = [  # public IPFS DHT entry points (Kubo defaults)
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
@@ -244,14 +246,8 @@ class Store:
         return cfg
 
     def set_config(self, **kw: Any) -> None:
-        """Replace the given config keys (nicks / blocked replace the whole mapping / list, as before)."""
+        """Set plain settings such as username (nicknames and blocks have set_nick / block / unblock)."""
         with self._tx() as db:
-            if "nicks" in kw:
-                db.execute("DELETE FROM nicks")
-                db.executemany("INSERT INTO nicks VALUES (?, ?)", kw.pop("nicks").items())
-            if "blocked" in kw:
-                db.execute("DELETE FROM blocked")
-                db.executemany("INSERT OR IGNORE INTO blocked VALUES (?)", ((b,) for b in kw.pop("blocked")))
             db.executemany("INSERT OR REPLACE INTO settings VALUES (?, ?)", ((k, json.dumps(v)) for k, v in kw.items()))
 
     def username(self) -> str:
@@ -294,14 +290,6 @@ class Store:
     def has_peer(self, pid: str) -> bool:
         return self.db.execute("SELECT 1 FROM peers WHERE pid = ?", (pid,)).fetchone() is not None
 
-    def save_peers(self, peers: Json) -> None:
-        """Replace the whole peer table (kept for compatibility; remember_peer is the race-free way to update)."""
-        with self._tx() as db:
-            db.execute("DELETE FROM peers")
-            db.executemany("INSERT INTO peers (pid, name, addrs, seen) VALUES (?, ?, ?, ?)",
-                           ((pid, e.get("name"), json.dumps(e.get("addrs", [])), float(e.get("seen", 0)))
-                            for pid, e in peers.items()))
-
     def remember_peer(self, pid: str, addrs: list[str], name: str | None, seen: float | None = None) -> None:
         """Upsert one peer atomically: keep its old name/addrs when none are given, always bump `seen`."""
         self.db.execute(
@@ -338,6 +326,9 @@ class Store:
     def log_message(self, peer: str, direction: str, text: str) -> None:
         self.db.execute("INSERT INTO messages (ts, peer, dir, text) VALUES (?, ?, ?, ?)",
                         (time.time(), peer, direction, text))
+
+    def last_message_id(self) -> int:
+        return self.db.execute("SELECT coalesce(max(id), 0) FROM messages").fetchone()[0]
 
     def messages(self, peer: str | None = None, last: int | None = None, after: int = 0,
                  include_blocked: bool = True) -> list[Json]:
@@ -569,6 +560,7 @@ class Node:
 
     async def remember(self, pid: ID, name: str | None) -> None:
         """Record an encountered chat peer (with its self-assigned username) in the store."""
+        name = name[:MAX_NAME] if isinstance(name, str) else None  # untrusted: it's stored and re-shared via PEX
         await self.astore.remember_peer(pid.to_base58(), [str(a) for a in self.addrs(pid)], name)
 
     # --- the /gnosis-mesh protocol: one JSON request + one JSON reply per stream ---
@@ -580,7 +572,7 @@ class Node:
         try:
             req = json.loads(await read_all(stream))
             await self.remember(pid, req.get("name"))
-            reply: Json = {"name": self.store.config()["username"]}
+            reply: Json = {"name": self.store.username()}
             if req["t"] == "msg":
                 await self.astore.log_message(pid.to_base58(), "in", req["text"])
                 if self.echo:
@@ -598,16 +590,18 @@ class Node:
     async def request(self, pid: ID, t: str, **body: Any) -> Json:
         with trio.fail_after(30):
             stream = await self.host.new_stream(pid, [PROTO])
-            await stream.write(json.dumps({"t": t, "name": self.store.config()["username"], **body}).encode())
+            await stream.write(json.dumps({"t": t, "name": self.store.username(), **body}).encode())
             await stream.close_write()  # type: ignore[attr-defined]  # NetStream has it; the ABC doesn't
             reply = json.loads(await read_all(stream))
             await stream.close()
         await self.remember(pid, reply.get("name"))
-        for p in reply.get("peers", []):  # peer exchange: learn addresses of peers they met
-            try:
-                self.learn(ID.from_base58(p["id"]), p.get("addrs", []))
-            except Exception:
-                pass
+        if isinstance(reply.get("peers"), list):  # peer exchange: learn addresses of (at most PEX_LIMIT) peers they met
+            reply["peers"] = reply["peers"][:PEX_LIMIT]
+            for p in reply["peers"]:
+                try:
+                    self.learn(ID.from_base58(p["id"]), list(p.get("addrs", []))[:MAX_ADDRS])
+                except Exception:
+                    pass
         return reply
 
     async def greet(self, pid: ID, t: str = "hello") -> None:
@@ -905,7 +899,12 @@ class Node:
 
     async def announce_loop(self) -> None:
         while True:
-            if not await self.announce():
+            try:
+                announced = await self.announce()
+            except Exception as e:  # a DHT error must not escape maintain() and take the node down
+                log.info("announce failed: %s", e)
+                announced = False
+            if not announced:
                 await trio.sleep(15)
                 continue
             self.reannounce = trio.Event()
@@ -1199,10 +1198,11 @@ def send(store: Store, peer: str, message: tuple[str, ...]) -> None:
 def read(store: Store, peer: str | None, last: int, follow: bool) -> None:
     """Read messages, optionally only the conversation with PEER."""
     pid = store.resolve(peer) if peer else None
-    msgs = store.messages(peer=pid, last=last or None, include_blocked=False)
+    top = store.last_message_id()  # follow from the newest message of any peer, not the newest match: a peer
+    msgs = store.messages(peer=pid, last=last or None, include_blocked=False)  # unblocked later shows no old ones
     for m in msgs:
         click.echo(fmt_msg(store, m))
-    seen = msgs[-1]["id"] if msgs else 0  # no match yet means every later match is new
+    seen = max(top, msgs[-1]["id"] if msgs else 0)
     while follow:  # each poll is an indexed range scan over only the new rows
         time.sleep(1)
         for m in store.messages(peer=pid, after=seen, include_blocked=False):
