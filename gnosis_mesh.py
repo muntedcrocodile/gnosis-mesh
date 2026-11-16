@@ -70,7 +70,7 @@ RELAY_TARGET = 3  # public relay reservations to hold while behind NAT
 MESH_TARGET = 8  # chat peers to stay connected to; below this, discover() looks for more
 DIAL_ON_START = 64  # most recently seen known peers to reconnect to when the node starts
 MAX_NAME = 64  # longest username we store or pass on (a remote peer chooses it)
-MAX_ADDRS = 32  # most addresses we store or accept via peer exchange for one peer
+MAX_ADDRS = 32  # most addresses we keep for one peer
 PEX_LIMIT = 200  # most recently seen peers to share in a "peers" reply (keeps it well under MAX_MSG)
 IPFS_BOOTSTRAP = [  # public IPFS DHT entry points (Kubo defaults)
     "/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
@@ -378,18 +378,19 @@ class Node:
         self.host.get_private_key = lambda: self.keys.private_key  # type: ignore[method-assign]
         # Join the public DHT as a client until AutoNAT confirms we are reachable.
         self.dht = KadDHT(self.host, DHTMode.CLIENT if public else DHTMode.SERVER, enable_random_walk=True)
-        # Every node is a relay (rendezvous point) for other chat peers; see hop_acl.
+        # Every node is a relay (rendezvous point) for other chat peers; see relay_reserve / relay_connect.
         self.circuit = CircuitV2Protocol(self.host, RelayLimits(duration=3600, data=16 << 20, max_circuit_conns=64,
                                                                 max_reservations=64), allow_hop=True)
-        self.relay_hop = self.circuit._handle_hop_stream
-        self.circuit._handle_hop_stream = self.hop_acl  # type: ignore[method-assign]
+        self.lib_reserve, self.lib_connect = self.circuit._handle_reserve, self.circuit._handle_connect
+        self.circuit._handle_reserve = self.relay_reserve  # type: ignore[method-assign]
+        self.circuit._handle_connect = self.relay_connect  # type: ignore[method-assign]
         self.relay = CircuitV2Transport(self.host, self.circuit, RelayConfig(roles=RelayRole.STOP | RelayRole.CLIENT))
         self.relay.discovery.auto_reserve = False  # we choose relays ourselves (keep_relays)
         self.dcutr = DCUtRProtocol(self.host)
         self.autonat = AutoNATService(self.host)  # type: ignore[arg-type]
         self.reachability = AutoNATStatus.UNKNOWN
         self.greeted: set[ID] = set()
-        self.recent_ids: collections.deque[str | None] = collections.deque(maxlen=1000)  # of delivered messages
+        self.recent_ids: collections.deque[tuple[ID, str]] = collections.deque(maxlen=1000)  # delivered (sender, id)
         self.dial_errors: list[str] = []
         self.upnp_ports: list[tuple[str, str]] = []
         self.last_addrs: set[str] = set()
@@ -428,8 +429,10 @@ class Node:
         return addrs
 
     def learn(self, pid: ID, addrs: list[str]) -> None:
+        """Add addresses for pid, at most MAX_ADDRS in total: a peer-exchange reply can name any peer, any number of
+        times, and the peerstore keeps every distinct address it is given."""
         ma = []
-        for a in addrs:
+        for a in list(addrs)[:max(0, MAX_ADDRS - len(self.addrs(pid)))]:
             try:
                 ma.append(Multiaddr(a))
             except Exception:
@@ -474,18 +477,22 @@ class Node:
         try:
             with trio.fail_after(30):  # a peer that never finishes its request mustn't hold the handler forever
                 req = json.loads(await read_all(stream))
-            await self.remember(pid, req.get("name"))
+            if self.blocked(pid.to_base58()):  # blocked while the request was arriving
+                raise PermissionError("blocked")
             reply: Json = {"name": self.store.username()}
             if req["t"] == "msg":
-                mid = req.get("id")  # older peers send none
-                if mid is None or mid not in self.recent_ids:  # a retry of a delivered message is dropped
-                    self.recent_ids.append(mid)
+                mid = req.get("id")  # older peers send none; a retry of a delivered message is dropped
+                key = (pid, mid) if isinstance(mid, str) and len(mid) <= 64 else None
+                if key is None or key not in self.recent_ids:
                     await self.astore.log_message(pid.to_base58(), "in", req["text"])
+                    if key:  # only once stored, so a retry after a failed write is stored after all
+                        self.recent_ids.append(key)
                     if self.echo:
                         click.echo(f"\n[{self.store.label(pid.to_base58())}] {req['text']}")
             elif req["t"] == "peers":
                 reply["peers"] = [{"id": k, **v} for k, v in self.store.recent_peers(PEX_LIMIT).items()
                                   if k != pid.to_base58()]
+            await self.remember(pid, req.get("name"))
             await stream.write(json.dumps(reply).encode())
             await stream.close()
             self.greeted.add(pid)
@@ -510,7 +517,7 @@ class Node:
             reply["peers"] = reply["peers"][:PEX_LIMIT]
             for p in reply["peers"]:
                 try:
-                    self.learn(ID.from_base58(p["id"]), list(p.get("addrs", []))[:MAX_ADDRS])
+                    self.learn(ID.from_base58(p["id"]), p.get("addrs", []))
                 except Exception:
                     pass
         return reply
@@ -643,10 +650,8 @@ class Node:
             return False
         with trio.move_on_after(120):
             closest = await self.dht.peer_routing.find_closest_peers_network(self.host.get_id().to_bytes())
-            async with trio.open_nursery() as n:
-                n.start_soon(self.dht.provide, MESH_KEY)  # so nodes that know no chat peer yet can find us
-                provided = bool(await self.dht.provide(rendezvous_key(self.me)))
-            log.info("announced: %d closest peers, provider record stored=%s", len(closest), provided)
+            provided = bool(await self.dht.provide(rendezvous_key(self.me))) and bool(await self.dht.provide(MESH_KEY))
+            log.info("announced: %d closest peers, provider records stored=%s", len(closest), provided)
             return provided
         log.info("announce timed out")
         return False
@@ -712,16 +717,19 @@ class Node:
         """Connected chat peers offering the relay (hop) service, i.e. usable rendezvous points."""
         return [p for p in self.chat_peers() if self.speaks(p, HOP_PROTOCOL_ID)]
 
-    async def hop_acl(self, stream: INetStream) -> None:
-        """Relay only for fellow chat peers (we are a rendezvous point for them, not a public relay)."""
-        pid = stream.muxed_conn.peer_id
-        reservations = self.circuit.resource_manager._reservations  # the library checks only that a target has one,
-        for p in [p for p in reservations if self.blocked(p.to_base58())]:  # so drop those of blocked peers
-            del reservations[p]
-        if self.speaks(pid, PROTO) and not self.blocked(pid.to_base58()):
-            await self.relay_hop(stream)
-        else:
-            await stream.reset()
+    # Relay only for fellow chat peers (a rendezvous point for them, not a public relay), never to or from a blocked
+    # peer. Checked on every hop request, not once per stream: one hop stream can carry any number of them.
+    def relay_allowed(self, pid: ID) -> bool:
+        return self.speaks(pid, PROTO) and not self.blocked(pid.to_base58())
+
+    async def relay_reserve(self, stream: INetStream, msg: Any) -> None:
+        src = stream.muxed_conn.peer_id  # the library would reserve for whatever peer ID the message names
+        ok = self.relay_allowed(src) and (not msg.peer.id or msg.peer.id == src.to_bytes())
+        await (self.lib_reserve(stream, msg) if ok else stream.reset())
+
+    async def relay_connect(self, stream: INetStream, msg: Any) -> None:
+        ok = self.relay_allowed(stream.muxed_conn.peer_id) and not self.blocked(ID(msg.peer.id).to_base58())
+        await (self.lib_connect(stream, msg) if ok else stream.reset())
 
     async def reserve(self, relay: ID) -> None:
         d = self.relay.discovery
@@ -934,6 +942,7 @@ class Node:
                 os.unlink(self.store.sock)
             sock = trio.socket.socket(trio.socket.AF_UNIX)
             await sock.bind(self.store.sock)
+            os.chmod(self.store.sock, 0o600)  # before listen(): until then nobody can connect
             sock.listen()
             n.start_soon(trio.serve_listeners, lambda c: self.control(c, n.cancel_scope), [trio.SocketListener(sock)])
         os.unlink(self.store.sock)
@@ -1092,16 +1101,18 @@ def send(store: Store, peer: str, message: tuple[str, ...]) -> None:
 def read(store: Store, peer: str | None, last: int, follow: bool) -> None:
     """Read messages, optionally only the conversation with PEER."""
     pid = store.resolve(peer) if peer else None
-    top = store.last_message_id()  # follow from the newest message of any peer, not the newest match: a peer
-    msgs = store.messages(peer=pid, last=last or None, include_blocked=False)  # unblocked later shows no old ones
-    for m in msgs:
-        click.echo(fmt_msg(store, m))
-    seen = max(top, msgs[-1]["id"] if msgs else 0)
-    while follow:  # each poll is an indexed range scan over only the new rows
-        time.sleep(1)
-        for m in store.messages(peer=pid, after=seen, include_blocked=False):
-            seen = m["id"]
+    seen, limit = 0, last or None
+    while True:
+        # Every message up to `top` is now either shown or hidden (blocked or another peer's); skip past both, so a
+        # poll only scans new rows and unblocking someone later doesn't replay their old messages.
+        top = store.last_message_id()
+        for m in store.messages(peer=pid, after=seen, last=limit, include_blocked=False):
             click.echo(fmt_msg(store, m))
+            top = max(top, m["id"])
+        if not follow:
+            return
+        seen, limit = top, None
+        time.sleep(1)
 
 
 @cli.command()

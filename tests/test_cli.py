@@ -1,6 +1,11 @@
 """CLI commands that only touch the store (no daemon), run against a temporary --home."""
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -45,3 +50,30 @@ def test_read_and_peers(home: Path) -> None:
     out = run(home, "peers")
     assert f"{a}  username=alice" in out and "[blocked]" in out
     assert b not in run(home, "peers", "--named")
+
+
+def test_follow_never_replays_a_blocked_peers_messages(home: Path) -> None:
+    a, b = new_pid(), new_pid()
+    s = Store(home)
+    s.block(b)
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    proc = subprocess.Popen([sys.executable, "gnosis_mesh.py", "--home", str(home), "read", "-f"],
+                            cwd=Path(__file__).parent.parent, stdout=subprocess.PIPE, text=True, env=env)
+    killer = threading.Timer(20, proc.kill)  # never hang the suite
+    killer.start()
+    try:
+        time.sleep(1.5)
+        s.log_message(b, "in", "hidden")
+        time.sleep(2.5)  # at least one poll passes while b is blocked
+        s.unblock(b)
+        s.log_message(a, "in", "visible")
+        seen = []
+        while proc.stdout and (line := proc.stdout.readline()):
+            seen.append(line)
+            if "visible" in line:
+                break
+    finally:
+        proc.kill()
+        killer.cancel()
+        s.close()
+    assert any("visible" in line for line in seen) and not any("hidden" in line for line in seen)

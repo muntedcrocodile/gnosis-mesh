@@ -128,32 +128,33 @@ messages (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, peer TEXT,
 
 ### Public interface
 
-Every existing method keeps its signature and return shape: `home`, `sock`, `config()`, `set_config(**kw)`,
-`peers()`, `save_peers()`, `key_seed()`, `log_message()`, `messages()`, `label()`, `resolve()`. One small
-difference: `messages()` rows now also include an `id`.
+These methods keep their old signatures and return shapes: `home`, `sock`, `config()`, `peers()`, `key_seed()`,
+`log_message()`, `messages()`, `label()`, `resolve()`. Two differences: `messages()` rows now include an `id`,
+and `set_config(**kw)` only sets plain settings such as `username`. `save_peers()` is gone. `resolve()` now tries a
+literal peer ID before usernames, so a peer can't claim another peer's ID as its username.
 
 New methods were added for the hot paths:
 
 | Method | Replaces |
 |---|---|
 | `is_blocked`, `block`, `unblock`, `set_nick`, `username` | Read-modify-write of the whole config |
-| `remember_peer(pid, addrs, name)` | `peers()` → edit → `save_peers()` (now one atomic `UPSERT`) |
-| `has_peer`, `recent_peers(limit, exclude_blocked)` | Loading the whole peer dict to test membership or pick peers |
+| `remember_peer(pid, addrs, name)` | `peers()` → edit → save the whole dict (now one atomic `UPSERT`) |
+| `has_peer`, `recent_peers(limit)` (never includes blocked peers) | Loading the whole peer dict to test membership or pick peers |
 | `prune_peers(ttl, keep)` | – (new) |
-| `messages(peer, last, after, include_blocked)` | Python-side filtering of the whole history |
+| `messages(peer, last, after, include_blocked)`, `last_message_id()` | Python-side filtering of the whole history |
 
 ### Call-site changes outside `Store`
 
 The changes are deliberately small. None of them touch the mesh-discovery code (`discover`, `find_mesh_peers`,
-`exchange`).
+`announce`).
 
 * `Node.blocked` calls `store.is_blocked`.
 * `Node.remember` and message logging are awaited through `AsyncStore` (see section 2).
-* `Node.handle`: the `peers` reply uses `store.recent_peers(PEX_LIMIT, exclude_blocked=True)`.
+* `Node.handle`: the `peers` reply uses `store.recent_peers(PEX_LIMIT)`.
 * `Node.find` and the `status` command use `store.has_peer` instead of loading every peer.
-* `Node.background` dials `store.recent_peers(DIAL_ON_START=64, exclude_blocked=True)` instead of every peer.
+* `Node.background` dials `store.recent_peers(DIAL_ON_START)` (the 64 most recent) instead of every peer.
 * CLI: `start` prunes once at startup; `nick`/`block`/`unblock` use the single-row methods; `read`/`read -f`
-  filter in SQL and follow by id; `send`/`username`/`status` use the new lookups.
+  filter in SQL and follow by id, skipping past hidden messages; `send`/`username`/`status` use the new lookups.
 
 ## 5. Pruning
 

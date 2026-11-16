@@ -132,9 +132,9 @@ See [Running several identities](#running-several-identities).
 When you pass a name to any command, the CLI resolves it in this order:
 
 1. your nicknames;
-2. usernames of peers you've met (if two peers claim the same username, you're asked to use the peer ID or a
-   nickname instead);
-3. otherwise, the argument must be a valid peer ID.
+2. a valid peer ID, taken as is (so a peer can't claim someone else's ID as its username);
+3. usernames of peers you've met (if two peers claim the same username, you're asked to use the peer ID or a
+   nickname instead).
 
 Usernames only resolve for peers you've already met. To reach someone for the first time, use their peer ID.
 
@@ -177,8 +177,8 @@ A brand-new node knows no other chat peers. To get its first ones:
   3. dials a random selection of the new candidates. The selection is random so that new nodes don't all pile
      onto the same few peers.
 
-Every peer it reaches is saved in `peers.json` and reconnected on the next start. So the DHT is only needed
-the first time, or when every known peer has gone away.
+Every peer it reaches is saved in `store.db`, and the 64 most recently seen are redialled on the next start. So
+the DHT is only needed the first time, or when every known peer has gone away.
 
 **Measured on the public IPFS DHT:** a brand-new node, with mDNS off and no bootstrap peers or saved peers, found
 and connected to the only other gnosis-mesh node about 60 s after starting. Both nodes were behind NAT. That
@@ -268,8 +268,8 @@ or the system temp directory if that isn't set. If the resulting path would be t
   addresses run gnosis-mesh, and anyone can publish fake records under it. Candidates are only used once they
   connect and answer on the chat protocol.
 - **Your node relays traffic for other chat peers.** That's what makes the shared-peer rendezvous work. It's
-  limited to peers that speak this chat protocol and aren't blocked, with per-connection limits of 1 hour and
-  16 MiB.
+  limited to peers that speak this chat protocol and aren't blocked, never reaches a blocked peer, and has
+  per-connection limits of 1 hour and 16 MiB.
 - **Blocking is local.** A blocked peer can still see that you exist on the DHT. Blocking only stops your node
   from talking to it or relaying for it.
 
